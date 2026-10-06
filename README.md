@@ -93,11 +93,11 @@ GeoCR achieves the best FID and DISTS on full-band Sen2_MTC_New and SEN12MS-CR a
 - **Two modes:** the same checkpoint is used directly (**GeoCR (w/o FT)**) or adapted with LoRA (**GeoCR (LoRA)**).
 
 ## 🚀 Code Release
-- [x] Inference code
-- [x] Training scripts (Stage 1 stems, Stage 2 pretraining, LoRA)
-- [x] Evaluation scripts
-- [x] Pretrained weights and LoRA adapters
-- [x] Comparison methods: code, configurations and weights
+- ✅ Inference code
+- ✅ Training scripts (Stage 1 stems, Stage 2 pretraining, LoRA)
+- ✅ Evaluation scripts
+- ✅ Pretrained weights and LoRA adapters
+- ✅ Comparison methods: code, configurations and weights
 
 ## 🤗 Model Weights
 
