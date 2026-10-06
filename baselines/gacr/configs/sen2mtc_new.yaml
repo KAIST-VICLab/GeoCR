@@ -1,0 +1,86 @@
+logging:
+  output_dir: "${OUT}/runs"
+  exp_name: "sen2mtc_new_gacr"
+  logging_dir: "logs"
+  report_to: null
+  sampling_steps: 500
+  resume_step: 0
+  dev_select: false
+  early_stop_patience_evals: 0
+
+model:
+  in_channels: 16
+  out_channels: 4
+  patch_size: [2, 2]
+  widths: [128, 256, 512, 1024]
+  depths: [2, 2, 2, 2]
+  d_ffs: [256, 512, 1024, 2048]
+  self_attns:
+    - {type: "neighborhood", d_head: 64, kernel_size: 7}
+    - {type: "neighborhood", d_head: 64, kernel_size: 7}
+    - {type: "global", d_head: 64}
+    - {type: "global", d_head: 64}
+  dropout_rate: [0.0, 0.0, 0.0, 0.1]
+  mapping_depth: 2
+  mapping_width: 1024
+  mapping_d_ff: 2048
+  mapping_dropout_rate: 0.1
+
+gcpa:
+  vfm: "dinov3"
+  offline: false
+  native_resolution: true
+  model_path: "${DINOV3_WEIGHTS}"
+  source: "local"
+  repo_path: "${REPO}/vfm_hub"
+  model_name: "dinov3_vitl16"
+  feat_path: null
+  rgb_view: "display_gain2"
+
+dataset:
+  kind: "geocr"
+  corpus: "sen2mtc_new"
+  train_split: "trainval"
+  splits_dir: "splits"
+  root: null
+  val_split: "val"
+  val_max_items: null
+  val_batch_size: 8
+  cond_frames: 3
+  anchor_frame: 0
+  batch_size: 4
+  val_size: null
+  data_dir: ""
+  resolution: 256
+
+precision:
+  allow_tf32: false
+  mixed_precision: "fp16"
+
+optimization:
+  epochs: 294
+  max_train_steps: 200000
+  checkpointing_steps: 50000
+  gradient_accumulation_steps: 1
+  learning_rate: 0.0001
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 0.0
+  adam_epsilon: 1.0e-08
+  max_grad_norm: 1.0
+
+misc:
+  seed: 0
+  num_workers: 8
+  eval_num_steps: 4
+
+loss:
+  path_type: "linear"
+  prediction: "v"
+  cfg_prob: 0.1
+  enc_type: "dinov3-vit-l"
+  proj_coeff: 0.5
+  weighting: "uniform"
+  p: 3.0
+  legacy: false
+  proj_loss_impl: "loop"

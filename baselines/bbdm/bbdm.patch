@@ -1,0 +1,327 @@
+diff --git a/datasets/__init__.py b/datasets/__init__.py
+new file mode 100644
+index 0000000..c5ca32b
+--- /dev/null
++++ b/datasets/__init__.py
+@@ -0,0 +1 @@
++"""Makes ``datasets`` the local package, so it is not shadowed by an installed Hugging Face ``datasets``."""
+diff --git a/datasets/geocr_split.py b/datasets/geocr_split.py
+new file mode 100644
+index 0000000..773cf6d
+--- /dev/null
++++ b/datasets/geocr_split.py
+@@ -0,0 +1,30 @@
++"""dataset_type 'geocr_split': items ((clear, id), (cloudy, id)) in [-1, 1], read by split-list id.
++Stages 'train' and 'val' read dataset_config.train_split; 'test' reads the test split."""
++from pathlib import Path
++
++import torch
++from torch.utils.data import Dataset
++
++import geocr_data as G
++from Register import Registers
++
++
++@Registers.datasets.register_with_name('geocr_split')
++class GeoCRSplitAlignedDataset(Dataset):
++    def __init__(self, dataset_config, stage='train'):
++        super().__init__()
++        if not dataset_config.to_normal or dataset_config.flip or dataset_config.image_size != 256:
++            raise SystemExit("geocr_split supports to_normal: True, flip: False, image_size: 256")
++        self.cfg = G.corpus_cfg(dataset_config.corpus)
++        self.split = dataset_config.train_split if stage in ('train', 'val') else 'test'
++        self.ids = G.read_split(self.cfg, self.split)
++
++    def __len__(self):
++        return len(self.ids)
++
++    def __getitem__(self, i):
++        sid = self.ids[i]
++        x_cond = (torch.from_numpy(G.load_u01(self.cfg, self.split, sid, "cloudy")) - 0.5) * 2.0
++        x = (torch.from_numpy(G.load_u01(self.cfg, self.split, sid, "clear")) - 0.5) * 2.0
++        name = Path(G.sid_flat(sid)).stem
++        return (x, name), (x_cond, name)
+diff --git a/dump.py b/dump.py
+new file mode 100644
+index 0000000..542093b
+--- /dev/null
++++ b/dump.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python
++"""Write test-set predictions for geocr.eval: <out>/preds/<id>.npy (float32 CHW in [0, 1],
++unclipped) and <out>/manifest.json.
++
++    python dump.py --config <config.yaml> --ckpt <dir with last_model.pth> --out <dir>
++
++Sampling uses the EMA weights (the repository's test-time default), one image at a time with the
++global RNG seeded from (seed, id). The frozen VQGAN is restored from last_model.pth, so the vq-f4
++checkpoint named in the config is not needed here.
++"""
++import argparse
++import json
++from pathlib import Path
++
++import numpy as np
++import torch
++import yaml
++from tqdm import tqdm
++
++import geocr_data as G
++import rescore as RS
++from utils import dict2namespace
++
++
++def build_net(config, ckpt: Path, device):
++    from model.BrownianBridge.LatentBrownianBridgeModel import LatentBrownianBridgeModel
++    config.model.VQGAN.params.ckpt_path = None
++    net = LatentBrownianBridgeModel(config.model)
++    states = torch.load(ckpt, map_location="cpu", weights_only=False)
++    net.load_state_dict(states["model"], strict=True)
++    with torch.no_grad():
++        for n, p in net.named_parameters():
++            if p.requires_grad:
++                p.data.copy_(states["ema"][n].to(p.dtype))
++    return net.to(device).eval()
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--config", required=True)
++    ap.add_argument("--ckpt", required=True, help="directory holding last_model.pth")
++    ap.add_argument("--out", required=True)
++    ap.add_argument("--seed", type=int, default=0)
++    a = ap.parse_args()
++
++    with open(a.config) as f:
++        config = dict2namespace(yaml.load(f, Loader=yaml.FullLoader))
++    cfg = G.corpus_cfg(config.data.dataset_config.corpus)
++    ids = G.read_split(cfg, "test")
++    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    ckpt = Path(a.ckpt) / "last_model.pth"
++    net = build_net(config, ckpt, device)
++
++    preds = Path(a.out) / "preds"
++    preds.mkdir(parents=True, exist_ok=True)
++    with torch.no_grad():
++        for sid in tqdm(ids):
++            cloudy = G.load_u01(cfg, "test", sid, "cloudy")
++            x_cond = (torch.from_numpy(cloudy)[None].to(device) - 0.5) * 2.0
++            torch.manual_seed(G.sample_seed(a.seed, sid))
++            sample = net.sample(x_cond, clip_denoised=bool(config.testing.clip_denoised))
++            arr = ((sample[0].detach().float().cpu() + 1.0) / 2.0).numpy()
++            np.save(preds / f"{Path(G.sid_flat(sid)).stem}.npy",
++                    np.ascontiguousarray(arr, dtype=np.float32))
++
++    man = {"corpus": cfg["corpus"], "split": "test",
++           "split_list_sha256": G.split_sha256(cfg, "test"), "n_items": len(ids),
++           "resolution": list(cfg["resolution"]), "crop": "none", "bands": list(cfg["bands"]),
++           "domain": cfg["domain"], "processing_level": cfg["level"],
++           "ckpt_selection": "final",
++           "train_split_sha256": G.split_sha256(cfg, config.data.dataset_config.train_split),
++           "method": "bbdm", "seed": a.seed, "ckpt_sha256": RS.sha256_file(ckpt)}
++    missing = [k for k in RS.IDENTITY_KEYS if k not in man]
++    if missing:
++        raise SystemExit(f"manifest lacks {missing}")
++    (Path(a.out) / "manifest.json").write_text(json.dumps(man, indent=2) + "\n")
++    print(f"{len(ids)} predictions -> {a.out}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/geocr_data.py b/geocr_data.py
+new file mode 100644
+index 0000000..3bef48d
+--- /dev/null
++++ b/geocr_data.py
+@@ -0,0 +1,52 @@
++"""GeoCR data adapter: ids from <dataset root>/splits/<split>.txt, pixels from the 8-bit RGB
++export <CR_EXPORTS>/<corpus>/<split>/{cloudy,clear}/<id>.png, paired by id."""
++from __future__ import annotations
++
++import hashlib
++import os
++from pathlib import Path
++
++import numpy as np
++from PIL import Image
++
++import rescore as RS
++
++CR_EXPORTS = Path(os.environ.get("CR_EXPORTS", "CR_exports"))
++CORPORA = ("tcloud", "cuhk_cr2", "sen2mtc_new_rgb", "sen12mscr_rgb", "whus2crv_rgb")
++SPLITS_DIR = "splits"
++
++
++def corpus_cfg(name: str) -> dict:
++    if name not in CORPORA:
++        raise SystemExit(f"no BBDM config for {name!r}; choose from {CORPORA}")
++    return dict(RS.CORPORA[name], corpus=name)
++
++
++def sid_flat(sid: str) -> str:
++    return sid.replace("/", "__")
++
++
++def read_split(cfg: dict, split: str) -> list[str]:
++    return RS.read_split(Path(cfg["root"]), split, SPLITS_DIR)
++
++
++def split_sha256(cfg: dict, split: str) -> str:
++    return RS.sha256_file(Path(cfg["root"]) / SPLITS_DIR / f"{split}.txt")
++
++
++def sample_seed(seed: int, sid: str) -> int:
++    """Per-sample seed for the sampling noise: blake2b of (seed, id)."""
++    key = hashlib.blake2b(f"{seed}:{sid}".encode(), digest_size=8).digest()
++    return int.from_bytes(key, "big")
++
++
++def _png_u01(path: Path) -> np.ndarray:
++    with Image.open(path) as im:
++        a = np.asarray(im.convert("RGB"), dtype=np.uint8)
++    return np.ascontiguousarray(a.transpose(2, 0, 1)).astype(np.float32) / 255.0
++
++
++def load_u01(cfg: dict, split: str, sid: str, role: str) -> np.ndarray:
++    """One plane (role 'cloudy' or 'clear') as float32 CHW in [0, 1]."""
++    name = Path(sid_flat(sid)).with_suffix(".png").name
++    return _png_u01(CR_EXPORTS / cfg["corpus"] / split / role / name)
+diff --git a/model/VQGAN/vqgan.py b/model/VQGAN/vqgan.py
+index d5f0603..1c07596 100644
+--- a/model/VQGAN/vqgan.py
++++ b/model/VQGAN/vqgan.py
+@@ -61,7 +61,7 @@ class VQModel(pl.LightningModule):
+             self.monitor = monitor
+ 
+     def init_from_ckpt(self, path, ignore_keys=list()):
+-        sd = torch.load(path, map_location="cpu")["state_dict"]
++        sd = torch.load(path, map_location="cpu", weights_only=False)["state_dict"]
+         keys = list(sd.keys())
+         for k in keys:
+             for ik in ignore_keys:
+diff --git a/runners/BaseRunner.py b/runners/BaseRunner.py
+index 33decf5..03024d4 100644
+--- a/runners/BaseRunner.py
++++ b/runners/BaseRunner.py
+@@ -112,7 +112,7 @@ class BaseRunner(ABC):
+         model_states = None
+         if self.config.model.__contains__('model_load_path') and self.config.model.model_load_path is not None:
+             self.logger(f"load model {self.config.model.model_name} from {self.config.model.model_load_path}")
+-            model_states = torch.load(self.config.model.model_load_path, map_location='cpu')
++            model_states = torch.load(self.config.model.model_load_path, map_location='cpu', weights_only=False)
+ 
+             self.global_epoch = model_states['epoch']
+             self.global_step = model_states['step']
+@@ -128,7 +128,7 @@ class BaseRunner(ABC):
+             # load optimizer and scheduler
+             if self.config.args.train:
+                 if self.config.model.__contains__('optim_sche_load_path') and self.config.model.optim_sche_load_path is not None:
+-                    optimizer_scheduler_states = torch.load(self.config.model.optim_sche_load_path, map_location='cpu')
++                    optimizer_scheduler_states = torch.load(self.config.model.optim_sche_load_path, map_location='cpu', weights_only=False)
+                     for i in range(len(self.optimizer)):
+                         self.optimizer[i].load_state_dict(optimizer_scheduler_states['optimizer'][i])
+ 
+@@ -382,10 +382,16 @@ class BaseRunner(ABC):
+         start_epoch = self.global_epoch
+         self.logger(f"start training {self.config.model.model_name} on {self.config.data.dataset_name}, {len(train_loader)} iters per epoch")
+ 
++        # training.fixed_budget: stop exactly at n_steps micro-batches and save last_model.pth there;
++        # no validation or sampling runs during training.
++        fixed_budget = bool(getattr(self.config.training, 'fixed_budget', False))
++        if fixed_budget and self.config.args.save_top:
++            raise SystemExit("--save_top is not supported with training.fixed_budget")
+         try:
+             accumulate_grad_batches = self.config.training.accumulate_grad_batches
+             for epoch in range(start_epoch, self.config.training.n_epochs):
+-                if self.global_step > self.config.training.n_steps:
++                if self.global_step > self.config.training.n_steps or \
++                        (fixed_budget and self.global_step >= self.config.training.n_steps):
+                     break
+ 
+                 if self.config.training.use_DDP:
+@@ -438,11 +444,11 @@ class BaseRunner(ABC):
+                         )
+ 
+                     with torch.no_grad():
+-                        if self.global_step % 50 == 0:
++                        if (not fixed_budget) and self.global_step % 50 == 0:
+                             val_batch = next(iter(val_loader))
+                             self.validation_step(val_batch=val_batch, epoch=epoch, step=self.global_step)
+ 
+-                        if self.global_step % int(self.config.training.sample_interval * epoch_length) == 0:
++                        if (not fixed_budget) and self.global_step % int(self.config.training.sample_interval * epoch_length) == 0:
+                             # val_batch = next(iter(val_loader))
+                             # self.validation_step(val_batch=val_batch, epoch=epoch, step=self.global_step)
+ 
+@@ -451,13 +457,16 @@ class BaseRunner(ABC):
+                                 self.sample_step(val_batch=val_batch, train_batch=train_batch)
+                                 torch.cuda.empty_cache()
+ 
++                    if fixed_budget and self.global_step >= self.config.training.n_steps:
++                        break
++
+                 end_time = time.time()
+                 elapsed_rounded = int(round((end_time-start_time)))
+                 self.logger("training time: " + str(datetime.timedelta(seconds=elapsed_rounded)))
+ 
+                 # validation
+-                if (epoch + 1) % self.config.training.validation_interval == 0 or (
+-                        epoch + 1) == self.config.training.n_epochs:
++                if (not fixed_budget) and ((epoch + 1) % self.config.training.validation_interval == 0 or (
++                        epoch + 1) == self.config.training.n_epochs):
+                     # if self.is_main_process == 0:
+                     with torch.no_grad():
+                         self.logger("validating epoch...")
+@@ -468,7 +477,8 @@ class BaseRunner(ABC):
+                 # save checkpoint
+                 if (epoch + 1) % self.config.training.save_interval == 0 or \
+                         (epoch + 1) == self.config.training.n_epochs or \
+-                        self.global_step > self.config.training.n_steps:
++                        self.global_step > self.config.training.n_steps or \
++                        (fixed_budget and self.global_step >= self.config.training.n_steps):
+                     if self.is_main_process:
+                         with torch.no_grad():
+                             self.logger("saving latest checkpoint...")
+@@ -532,6 +542,8 @@ class BaseRunner(ABC):
+                                                    os.path.join(self.config.result.ckpt_path, model_ckpt_name))
+                                         torch.save(optimizer_scheduler_states,
+                                                    os.path.join(self.config.result.ckpt_path, optim_sche_ckpt_name))
++                if fixed_budget and self.global_step >= self.config.training.n_steps:
++                    break
+                 if self.config.training.use_DDP:
+                     dist.barrier()
+         except BaseException as e:
+diff --git a/runners/DiffusionBasedModelRunners/BBDMRunner.py b/runners/DiffusionBasedModelRunners/BBDMRunner.py
+index 3243ad5..e0b103f 100644
+--- a/runners/DiffusionBasedModelRunners/BBDMRunner.py
++++ b/runners/DiffusionBasedModelRunners/BBDMRunner.py
+@@ -32,7 +32,7 @@ class BBDMRunner(DiffusionBaseRunner):
+         states = None
+         if self.config.model.only_load_latent_mean_std:
+             if self.config.model.__contains__('model_load_path') and self.config.model.model_load_path is not None:
+-                states = torch.load(self.config.model.model_load_path, map_location='cpu')
++                states = torch.load(self.config.model.model_load_path, map_location='cpu', weights_only=False)
+         else:
+             states = super().load_model_from_checkpoint()
+ 
+@@ -60,7 +60,6 @@ class BBDMRunner(DiffusionBaseRunner):
+         optimizer = get_optimizer(config.model.BB.optimizer, net.get_parameters())
+         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=optimizer,
+                                                                mode='min',
+-                                                               verbose=True,
+                                                                threshold_mode='rel',
+                                                                **vars(config.model.BB.lr_scheduler)
+ )
+diff --git a/runners/utils.py b/runners/utils.py
+index ac16b15..4313e71 100644
+--- a/runners/utils.py
++++ b/runners/utils.py
+@@ -6,6 +6,7 @@ from datetime import datetime
+ from torchvision.utils import make_grid, save_image
+ from Register import Registers
+ from datasets.custom import CustomSingleDataset, CustomAlignedDataset, CustomInpaintingDataset
++from datasets.geocr_split import GeoCRSplitAlignedDataset
+ 
+ 
+ def remove_file(fpath):

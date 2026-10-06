@@ -1,0 +1,30 @@
+# CR_DATASETS=<data> python -m geocr.train configs/lora/t-cloud.yaml
+name: finetune_tcloud_lora
+data:
+  source: tcloud
+  root: ${oc.env:CR_DATASETS,CR_datasets}/T-CLOUD
+  train_split: trainval
+  resolution: 256
+  k_choices: [1]
+  k_probs: [1.0]
+  s1_drop: 1.0
+model:
+  ae_path: weights/vae/ae.safetensors
+  ms_enabled: false
+  lora_rank: 16
+  lora_alpha: 16.0
+flow:
+  time_scheme: logit_normal
+  shift: 1.36
+loss:
+  ms_weight: 0.0
+train:
+  seed: 2026
+  output_dir: runs/lora/t-cloud
+  init_from: weights/transformer
+  steps: 20000
+  batch_size: 8
+  grad_accum: 4
+  lr: 1.0e-4
+  warmup_steps: 1000
+  ckpt_keep: 2

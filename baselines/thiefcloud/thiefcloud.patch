@@ -1,0 +1,902 @@
+diff --git a/SCPM/src/test_cd.py b/SCPM/src/test_cd.py
+index 2a3f126..d094695 100644
+--- a/SCPM/src/test_cd.py
++++ b/SCPM/src/test_cd.py
+@@ -1,5 +1,4 @@
+ import os
+-os.environ['CUDA_VISIBLE_DEVICES']="0"
+ import sys
+ sys.path[0]="/home/zaq/Dehazing/SCPM"
+ import utils.scheduler
+diff --git a/SCPM/src/train_cd.py b/SCPM/src/train_cd.py
+index e24bb3b..10007f6 100644
+--- a/SCPM/src/train_cd.py
++++ b/SCPM/src/train_cd.py
+@@ -1,5 +1,4 @@
+ import os
+-os.environ['CUDA_VISIBLE_DEVICES']="0"
+ import sys
+ sys.path[0]="/home/zaq/Dehazing/SCPM"
+ import utils.scheduler
+diff --git a/ThiefCloud/demo.py b/ThiefCloud/demo.py
+index 6017c32..8fdc9ac 100644
+--- a/ThiefCloud/demo.py
++++ b/ThiefCloud/demo.py
+@@ -2,7 +2,7 @@ import os
+ import torch
+ import argparse
+ from PIL import Image
+-from model import EMPFNet
++from model import ThiefCloud
+ from pytorch_msssim import ssim
+ from utils import expand2square
+ import torch.nn.functional as F
+@@ -12,7 +12,7 @@ import torchvision.transforms.functional as ttf
+ 
+ def demo(args):
+ 
+-    model_restoration = EMPFNet().cuda() if args.cuda else EMPFNet()
++    model_restoration = ThiefCloud().cuda() if args.cuda else ThiefCloud()
+ 
+     if args.cuda:
+         model_restoration.load_state_dict(torch.load(args.resume_state))
+diff --git a/ThiefCloud/geocr_data.py b/ThiefCloud/geocr_data.py
+new file mode 100644
+index 0000000..c75bd6d
+--- /dev/null
++++ b/ThiefCloud/geocr_data.py
+@@ -0,0 +1,224 @@
++"""Split-list data sources for ThiefCloud (T-CLOUD, CUHK-CR, Sen2_MTC_New frame 0)."""
++from __future__ import annotations
++
++import os
++import sys
++from pathlib import Path
++
++import numpy as np
++import torch
++from torch.utils.data import Dataset
++
++_WORK = Path(__file__).resolve().parents[2]
++CR_DATASETS = Path(os.environ.get("CR_DATASETS", _WORK / "CR_datasets"))
++GEOCR_ROOT = Path(os.environ.get("GEOCR_ROOT", _WORK / "GeoCR"))
++BASELINES = Path(os.environ.get("GEOCR_BASELINES", GEOCR_ROOT / "baselines" / "common"))
++
++
++def _shared():
++    p = str(BASELINES / "exporters")
++    for q in (p, str(GEOCR_ROOT)):
++        if q not in sys.path:
++            sys.path.insert(0, q)
++    try:
++        import _common
++    except Exception as exc:
++        raise SystemExit(
++            f"cannot import exporters/_common.py from {p}: {exc}; set GEOCR_BASELINES") from exc
++    return _common
++
++
++def _geocr():
++    if str(GEOCR_ROOT) not in sys.path:
++        sys.path.insert(0, str(GEOCR_ROOT))
++    from geocr.data.benchmarks import _read_png, _read_tif, _resize_u8
++    return dict(read_png=_read_png, read_tif=_read_tif, resize_u8=_resize_u8)
++
++
++def sid_flat(sid: str) -> str:
++    return _shared().sid_flat(sid)
++
++
++def dump_key(sid: str) -> str:
++    return Path(sid_flat(sid)).stem
++
++
++def read_split(root: Path, split: str, splits_dir: str = "splits") -> list[str]:
++    return _shared().read_split(Path(root), split, splits_dir)
++
++
++CORPORA: dict[str, dict] = {
++    "tcloud": dict(
++        root=CR_DATASETS / "T-CLOUD", kind="display8", native=256, res=256,
++        clear_sub=[("/cloud/", "/reference/"), ("/cloud/", "/label/")],
++        lineage="tcloud", dev_key="tcloud_psnr", bands=["R", "G", "B"],
++        level="display8", domain="unit_float", dump_dir="tcloud",
++    ),
++    "cuhk_cr1": dict(
++        root=CR_DATASETS / "C-CUHK" / "CUHK-CR1", kind="display8", native=512, res=256,
++        clear_sub=[("/cloud/", "/label/")],
++        lineage="cuhk_rgb", dev_key="cuhkrgb_psnr", bands=["R", "G", "B"],
++        level="display8", domain="unit_float", dump_dir="cuhk_cr",
++    ),
++    "cuhk_cr2": dict(
++        root=CR_DATASETS / "C-CUHK" / "CUHK-CR2", kind="display8", native=512, res=256,
++        clear_sub=[("/cloud/", "/label/")],
++        lineage="cuhk_rgb", dev_key="cuhkrgb_psnr", bands=["R", "G", "B"],
++        level="display8", domain="unit_float", dump_dir="cuhk_cr2",
++    ),
++    "sen2mtc_new": dict(
++        root=CR_DATASETS / "Sen2_MTC_New", kind="sen2mtc", native=256, res=256,
++        clear_sub=None,
++        lineage="sen2mtc", dev_key="mtc_psnr", bands=["R", "G", "B", "NIR"],
++        level="boa", domain="reflectance", dump_dir="sen2mtc_new",
++        mtc_dn_ceiling=2000.0,
++    ),
++}
++
++ALIASES = {"cuhk_cr": "cuhk_cr1"}
++
++
++def resolve(corpus: str) -> str:
++    c = ALIASES.get(corpus, corpus)
++    if c not in CORPORA:
++        raise SystemExit(f"unknown corpus {corpus!r}; have {list(CORPORA)} "
++                         f"(aliases {ALIASES})")
++    return c
++
++
++def clear_id(sid: str, cfg: dict, root: Path) -> str:
++    for needle, repl in cfg["clear_sub"]:
++        if needle in sid:
++            cand = sid.replace(needle, repl)
++            if (root / cand).is_file():
++                return cand
++    raise SystemExit(f"no clear counterpart on disk for {sid} under {root}")
++
++
++def _u8_to_chw01(arr: np.ndarray) -> torch.Tensor:
++    if arr.ndim == 2:
++        arr = np.repeat(arr[..., None], 3, axis=-1)
++    arr = arr[..., :3]
++    return torch.from_numpy(np.ascontiguousarray(
++        arr.transpose(2, 0, 1).astype(np.float32) / 255.0))
++
++
++class Display8Source:
++
++    def __init__(self, corpus: str, split: str, cfg: dict, root: Path,
++                 export_root: Path | None, source: str = "auto"):
++        self.cfg, self.root, self.corpus, self.split = cfg, root, corpus, split
++        self.g = _geocr()
++        self.res = int(cfg["res"])
++        exp = None
++        if export_root is not None:
++            cand = Path(export_root) / corpus / split
++            if (cand / "list.txt").is_file():
++                exp = cand
++        if source == "export" and exp is None:
++            raise SystemExit(
++                f"source=export but no export at {export_root}/{corpus}/{split}. "
++                f"Run exporters/export_display8.py, or pass source=native.")
++        self.export = exp if source in ("auto", "export") else None
++        self.where = "exporter" if self.export is not None else "loader"
++
++    def pair(self, sid: str) -> tuple[torch.Tensor, torch.Tensor]:
++        if self.export is not None:
++            stem = dump_key(sid) + ".png"
++            c = self.g["read_png"](self.export / "cloudy" / stem)
++            t = self.g["read_png"](self.export / "clear" / stem)
++        else:
++            c = self.g["resize_u8"](self.g["read_png"](self.root / sid), self.res)
++            cid = clear_id(sid, self.cfg, self.root)
++            t = self.g["resize_u8"](self.g["read_png"](self.root / cid), self.res)
++        return _u8_to_chw01(c), _u8_to_chw01(t)
++
++
++class Sen2MTCSource:
++
++    def __init__(self, corpus: str, split: str, cfg: dict, root: Path,
++                 frame_index: int = 0):
++        self.cfg, self.root, self.frame = cfg, root, int(frame_index)
++        self.ceil = float(cfg["mtc_dn_ceiling"])
++        self.g = _geocr()
++
++    def cloudy_path(self, sid: str) -> Path:
++        t = self.root / sid
++        return t.parent.parent / "cloud" / f"{t.stem}_{self.frame}.tif"
++
++    def _rgb01(self, p: Path) -> torch.Tensor:
++        arr = self.g["read_tif"](p)
++        v = arr[:3].astype(np.float32)
++        return torch.from_numpy(np.ascontiguousarray(
++            np.clip(v, 0.0, self.ceil) / self.ceil))
++
++    def pair(self, sid: str) -> tuple[torch.Tensor, torch.Tensor]:
++        cp = self.cloudy_path(sid)
++        if not cp.is_file():
++            raise FileNotFoundError(f"{cp}: expected cloud frame {self.frame}")
++        return self._rgb01(cp), self._rgb01(self.root / sid)
++
++
++def make_source(corpus: str, split: str, cfg: dict, root: Path,
++                export_root: Path | None, source: str, frame_index: int):
++    if cfg["kind"] == "display8":
++        return Display8Source(corpus, split, cfg, root, export_root, source)
++    return Sen2MTCSource(corpus, split, cfg, root, frame_index)
++
++
++class SplitPairs(Dataset):
++
++    def __init__(self, src, ids: list[str], mode: str, patch_size: int = 256):
++        assert mode in ("train", "eval")
++        self.src, self.ids, self.mode, self.ps = src, list(ids), mode, int(patch_size)
++
++    def __len__(self) -> int:
++        return len(self.ids)
++
++    def __getitem__(self, index: int):
++        sid = self.ids[index % len(self.ids)]
++        input_, target = self.src.pair(sid)
++        if self.mode == "eval":
++            return input_, target, sid
++
++        import random
++        ps = self.ps
++        hh, ww = target.shape[1], target.shape[2]
++        rr = random.randint(0, hh - ps)
++        cc = random.randint(0, ww - ps)
++        aug = random.randint(0, 8)
++        input_ = input_[:, rr:rr + ps, cc:cc + ps]
++        target = target[:, rr:rr + ps, cc:cc + ps]
++        if aug == 1:
++            input_, target = input_.flip(1), target.flip(1)
++        elif aug == 2:
++            input_, target = input_.flip(2), target.flip(2)
++        elif aug == 3:
++            input_, target = torch.rot90(input_, dims=(1, 2)), torch.rot90(target, dims=(1, 2))
++        elif aug == 4:
++            input_, target = torch.rot90(input_, dims=(1, 2), k=2), torch.rot90(target, dims=(1, 2), k=2)
++        elif aug == 5:
++            input_, target = torch.rot90(input_, dims=(1, 2), k=3), torch.rot90(target, dims=(1, 2), k=3)
++        elif aug == 6:
++            input_, target = torch.rot90(input_.flip(1), dims=(1, 2)), torch.rot90(target.flip(1), dims=(1, 2))
++        elif aug == 7:
++            input_, target = torch.rot90(input_.flip(2), dims=(1, 2)), torch.rot90(target.flip(2), dims=(1, 2))
++        return input_, target
++
++
++def dev_metric(corpus: str, pred01, gt01) -> dict[str, float]:
++    if str(GEOCR_ROOT) not in sys.path:
++        sys.path.insert(0, str(GEOCR_ROOT))
++    from geocr.metrics import lineages as LIN
++    cfg = CORPORA[resolve(corpus)]
++    lin = cfg["lineage"]
++    if lin == "tcloud":
++        return LIN.tcloud_metrics(pred01[:, :3], gt01[:, :3])
++    if lin == "cuhk_rgb":
++        r = LIN._batched(LIN._cuhk_one, pred01[:, :3], gt01[:, :3], lpips=False)
++        return {k.replace("cuhk_", "cuhkrgb_"): v for k, v in r.items()}
++    if lin == "sen2mtc":
++        from geocr.metrics.sen2mtc import sen2mtc_metrics
++        s = cfg["mtc_dn_ceiling"] / 10000.0
++        return sen2mtc_metrics(pred01[:, :3] * s, gt01[:, :3] * s)
++    raise SystemExit(f"no dev metric for lineage {lin!r}")
+diff --git a/ThiefCloud/geocr_dump.py b/ThiefCloud/geocr_dump.py
+new file mode 100644
+index 0000000..9b4c1c7
+--- /dev/null
++++ b/ThiefCloud/geocr_dump.py
+@@ -0,0 +1,212 @@
++"""Write ThiefCloud predictions as CHW .npy files plus a manifest."""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import numpy as np
++import torch
++import yaml
++from torch.utils.data import DataLoader
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++import geocr_data as G
++from geocr_train import load_config, pick_device, seed_everything
++from model import ThiefCloud
++
++
++def sha256_file(p: Path) -> str:
++    h = hashlib.sha256()
++    with open(p, "rb") as fh:
++        for chunk in iter(lambda: fh.read(1 << 20), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++
++def code_rev(repo: Path) -> str:
++    try:
++        return subprocess.check_output(
++            ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
++            text=True, stderr=subprocess.DEVNULL).strip()
++    except Exception:
++        return "unknown"
++
++
++CODE_PATCHES = [
++    "model.py: SCPM checkpoint path from the repository (or THIEFCLOUD_SCPM_CKPT); torch.load map_location/weights_only",
++    "train.py, SCPM/src/{train_cd,test_cd}.py: no in-process CUDA_VISIBLE_DEVICES",
++    "train.py: --val_data and --pre_state defaults",
++    "test.py, demo.py: model class import",
++    "new: geocr_data.py geocr_train.py geocr_dump.py",
++]
++
++
++@torch.no_grad()
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--config", required=True)
++    ap.add_argument("--ckpt", required=True,
++                    help="final.pth written by geocr_train.py")
++    ap.add_argument("--run-meta", default=None, help="run_meta.json from the same run")
++    ap.add_argument("--split", default="test")
++    ap.add_argument("--dumps", default=None, help="dump root (default from config)")
++    ap.add_argument("--run-id", default=None,
++                    help="default YYYYMMDD_<config-sha8>_seed<N>")
++    ap.add_argument("--batch-size", type=int, default=1)
++    ap.add_argument("--limit", type=int, default=0,
++                    help="predict only the first N ids (testing)")
++    ap.add_argument("--preview", action="store_true",
++                    help="also write uint8 PNG previews")
++    ap.add_argument("overrides", nargs="*", default=[])
++    args = ap.parse_args()
++
++    cfg = load_config(args.config, args.overrides)
++    corpus = G.resolve(cfg["corpus"])
++    ccfg = G.CORPORA[corpus]
++    repo = Path(__file__).resolve().parent.parent
++
++    root = Path(cfg["root"]) if cfg.get("root") else ccfg["root"]
++    export_root = Path(cfg["export_root"]) if cfg.get("export_root") else None
++    ids = G.read_split(root, args.split, cfg["splits_dir"])
++    split_list = root / cfg["splits_dir"] / f"{args.split}.txt"
++    train_split_p = root / cfg["splits_dir"] / f"{cfg['train_split']}.txt"
++    if args.limit:
++        ids = ids[:args.limit]
++
++    seed_everything(int(cfg["seed"]))
++    device = pick_device(cfg)
++    model = ThiefCloud(swich=True).to(device)
++    model.load_state_dict(torch.load(args.ckpt, map_location=device,
++                                     weights_only=True))
++    model.eval()
++
++    src = G.make_source(corpus, args.split, ccfg, root, export_root,
++                        cfg["source"], int(cfg["frame_index"]))
++    ds = G.SplitPairs(src, ids, "eval")
++    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
++                        drop_last=False, num_workers=int(cfg["num_works"]),
++                        pin_memory=True)
++
++    dumps = Path(args.dumps) if args.dumps else Path(cfg["dump_root"])
++    run_id = args.run_id or (
++        f"{time.strftime('%Y%m%d')}_"
++        f"{hashlib.sha256(Path(args.config).read_bytes()).hexdigest()[:8]}_"
++        f"seed{int(cfg['seed'])}")
++    out = dumps / ccfg["dump_dir"] / args.split / "thiefcloud" / run_id
++    (out / "preds").mkdir(parents=True, exist_ok=True)
++    if args.preview:
++        (out / "preview").mkdir(parents=True, exist_ok=True)
++
++    is_mtc = ccfg["kind"] == "sen2mtc"
++    scale = (ccfg["mtc_dn_ceiling"] / 10000.0) if is_mtc else 1.0
++    n_out = len(ccfg["bands"])
++
++    t0 = time.time()
++    written = []
++    for x, _y, sids in loader:
++        x = x.to(device, non_blocking=True)
++        h, w = x.shape[-2:]
++        if h % 8 or w % 8:
++            raise SystemExit(f"{sids[0]}: {h}x{w} is not divisible by 8 "
++                             f"(SCPM has three AvgPool2d(2), cd_model.py:482-488)")
++        out_b = model(x, only_last=True).float().clamp(0, 1).cpu().numpy()
++        for i, sid in enumerate(sids):
++            a = out_b[i] * scale
++            if is_mtc:
++                full = np.full((n_out, *a.shape[1:]), np.nan, dtype=np.float32)
++                full[:3] = a
++                a = full
++            key = G.dump_key(sid)
++            np.save(out / "preds" / f"{key}.npy", np.ascontiguousarray(a, dtype=np.float32))
++            written.append(key)
++            if args.preview:
++                from PIL import Image
++                u8 = np.clip(out_b[i][:3] * 255.0, 0, 255).astype(np.uint8)
++                Image.fromarray(u8.transpose(1, 2, 0)).save(
++                    out / "preview" / f"{key}.png")
++
++    expect = [G.dump_key(s) for s in ids]
++    if sorted(written) != sorted(expect):
++        raise SystemExit(f"{out}: wrote {len(written)} keys, split list has "
++                         f"{len(expect)} -- refusing to leave a dump whose key "
++                         f"set is not equal to the split list.")
++    if args.limit:
++        print(f"WARNING: --limit {args.limit} was used; this dump is a subset.", flush=True)
++
++    meta = {}
++    if args.run_meta and Path(args.run_meta).is_file():
++        meta = json.loads(Path(args.run_meta).read_text())
++
++    manifest = {
++        "corpus": corpus, "split": args.split,
++        "split_list": str(split_list),
++        "split_list_sha256": sha256_file(split_list),
++        "n_items": len(expect),
++        "resolution": [ccfg["res"], ccfg["res"]],
++        "crop": "none",
++        "bands": list(ccfg["bands"]),
++        "domain": ccfg["domain"],
++        "processing_level": ccfg["level"],
++        "native_resolution": [ccfg["native"], ccfg["native"]],
++        "resample": ({"op": "PIL.BICUBIC", "where": getattr(src, "where", "loader"),
++                      "stage": "pre-inference"}
++                     if ccfg["native"] != ccfg["res"] else
++                     {"op": "none", "where": "n/a", "stage": "n/a"}),
++        "dtype": "float32",
++        "bands_predicted": ["R", "G", "B"],
++        "nir_plane": ("NaN (not predicted)" if is_mtc else None),
++        "method": "thiefcloud", "method_variant": Path(args.config).name,
++        "run_id": run_id,
++        "code_rev": code_rev(repo), "code_patches": CODE_PATCHES,
++        "ckpt": str(Path(args.ckpt).resolve()),
++        "ckpt_sha256": sha256_file(Path(args.ckpt)),
++        "scpm_ckpt": os.environ.get("THIEFCLOUD_SCPM_CKPT") or str(
++            repo / "SCPM" / "checkpointsCDNet_V1" / "best_CDNet_V1_SateHaze1k.pth"),
++        "scpm_ckpt_sha256": sha256_file(Path(
++            os.environ.get("THIEFCLOUD_SCPM_CKPT") or
++            repo / "SCPM" / "checkpointsCDNet_V1" / "best_CDNet_V1_SateHaze1k.pth")),
++        "ckpt_selection": meta.get("ckpt_selection", cfg["ckpt_selection"]),
++        "ema": meta.get("ema", False),
++        "train_split": str(train_split_p),
++        "train_split_sha256": sha256_file(train_split_p),
++        "dev_split_sha256": (None if cfg["ckpt_selection"] == "final"
++                             else sha256_file(root / cfg["splits_dir"] / "val.txt")),
++        "n_train": meta.get("n_train"),
++        "seed": int(meta.get("seed", cfg["seed"])),
++        "sampler": {"type": "deterministic_feedforward", "nfe": 1},
++        "frames_used": 1,
++        "frame_rule": ("frame index 0" if is_mtc else "n/a"),
++        "sar_used": False, "sar_fill": "n/a",
++        "postprocess": ("clamp[0,1] in the model domain then x%.4f -> reflectance"
++                        % scale) if is_mtc else "clamp[0,1]",
++        "input_map": ("DN clipped to [0,%g] / %g"
++                      % (ccfg["mtc_dn_ceiling"], ccfg["mtc_dn_ceiling"]))
++                     if is_mtc else "png/255",
++        "steps_used": meta.get("steps_used"), "epochs_used": meta.get("epochs_used"),
++        "ceiling_hit": meta.get("ceiling_hit"),
++        "early_stopped": meta.get("early_stopped"),
++        "dev_metric": meta.get("dev_metric"), "dev_best": meta.get("dev_best"),
++        "dev_evaluations_consumed": meta.get("dev_evaluations_consumed"),
++        "dev_slope_last10": meta.get("dev_slope_last10"),
++        "batch_global": meta.get("batch_global"), "microbatch": meta.get("microbatch"),
++        "grad_accum": meta.get("grad_accum"), "lr": meta.get("lr"),
++        "lr_point": meta.get("lr_point"),
++        "wall_clock_h": meta.get("wall_clock_h"),
++        "gpu": meta.get("gpu", "cpu"),
++        "params_trainable": meta.get("params_trainable"),
++        "params_total": meta.get("params_total"),
++        "inference_wall_h": round((time.time() - t0) / 3600.0, 5),
++        "subset": bool(args.limit),
++    }
++    (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
++    print(f"[thiefcloud] wrote {len(written)} preds to {out}", flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/ThiefCloud/geocr_train.py b/ThiefCloud/geocr_train.py
+new file mode 100644
+index 0000000..ada005c
+--- /dev/null
++++ b/ThiefCloud/geocr_train.py
+@@ -0,0 +1,335 @@
++"""Two-stage ThiefCloud training on a split list for a fixed number of optimizer steps."""
++from __future__ import annotations
++
++import argparse
++import json
++import math
++import os
++import random
++import sys
++import time
++from pathlib import Path
++
++import numpy as np
++import torch
++import torch.backends.cudnn as cudnn
++import torch.nn.functional as F
++import torch.optim as optim
++import yaml
++from torch.cuda.amp import GradScaler, autocast
++from torch.utils.data import DataLoader
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++import geocr_data as G
++from model import ThiefCloud
++from perceptual import LossNetwork
++
++
++def load_config(path: str, overrides: list[str]) -> dict:
++    cfg = yaml.safe_load(Path(path).read_text())
++    for kv in overrides:
++        if "=" not in kv:
++            raise SystemExit(f"override {kv!r} is not key=value")
++        k, v = kv.split("=", 1)
++        if k not in cfg:
++            raise SystemExit(f"unknown config key {k!r}; have {sorted(cfg)}")
++        cfg[k] = yaml.safe_load(v)
++    return cfg
++
++
++def seed_everything(seed: int) -> None:
++    random.seed(seed)
++    np.random.seed(seed)
++    torch.manual_seed(seed)
++    if torch.cuda.is_available():
++        torch.cuda.manual_seed_all(seed)
++
++
++def pick_device(cfg: dict) -> torch.device:
++    if cfg.get("device"):
++        return torch.device(cfg["device"])
++    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
++
++
++@torch.no_grad()
++def evaluate(model, loader, corpus: str, device, key: str) -> float:
++    model.eval()
++    vals = []
++    for x, y, _ in loader:
++        x = x.to(device, non_blocking=True)
++        out = model(x, only_last=True).float().clamp(0, 1).cpu()
++        for i in range(out.shape[0]):
++            vals.append(G.dev_metric(corpus, out[i:i + 1], y[i:i + 1])[key])
++    model.train()
++    return float(sum(vals) / len(vals))
++
++
++def run_stage(stage: int, cfg: dict, model, train_loader, dev_loader, device,
++              lr: float, steps: int, state: dict) -> None:
++    corpus, key = state["corpus"], state["dev_key"]
++    optimizer = optim.Adam(model.parameters(), lr=lr)
++    scheduler = optim.lr_scheduler.CosineAnnealingLR(
++        optimizer, T_max=max(steps, 1), eta_min=float(cfg["lr_min"]))
++    scaler = GradScaler(enabled=bool(cfg["autocast"]) and device.type == "cuda")
++    loss_network = state["loss_network"]
++    w = float(cfg["loss_weight1"])
++    eval_every = int(state["eval_every"])
++    select = state["ckpt_selection"]
++    patience = int(cfg["patience_evals"]) if select == "best_on_dev" else None
++
++    model.train()
++    since_improved, step = 0, 0
++    it = iter(train_loader)
++    t0 = time.time()
++    while step < steps:
++        try:
++            x, y = next(it)
++        except StopIteration:
++            it = iter(train_loader)
++            state["epochs"] += 1
++            x, y = next(it)
++
++        x = x.to(device, non_blocking=True)
++        y = y.to(device, non_blocking=True)
++
++        model.zero_grad()
++        optimizer.zero_grad()
++        with autocast(enabled=bool(cfg["autocast"]) and device.type == "cuda"):
++            restored, fake_x4, fake_x2 = model(x, only_last=False)
++            loss_2 = (2.4 * F.mse_loss(restored, y)
++                      + 0.3 * F.mse_loss(fake_x4, y)
++                      + 0.3 * F.mse_loss(fake_x2, y))
++            fake_x4 = fake_x4.to(dtype=torch.float32)
++            fake_x2 = fake_x2.to(dtype=torch.float32)
++            loss_perceptual = (loss_network(restored, y)
++                               + loss_network(fake_x4, y)
++                               + loss_network(fake_x2, y))
++            loss = loss_2 + w * loss_perceptual
++        optimizer.zero_grad()
++        scaler.scale(loss).backward()
++        scaler.step(optimizer)
++        scaler.update()
++
++        scheduler.step()
++        step += 1
++        state["steps"] += 1
++
++        if step % eval_every == 0 or step == steps:
++            if select == "final":
++                rec = {"stage": stage, "stage_step": step,
++                       "global_step": state["steps"],
++                       "lr": scheduler.get_last_lr()[0],
++                       "loss": float(loss.detach().float().item())}
++                state["train_history"].append(rec)
++                print(f"[stage {stage}] step {step}/{steps} "
++                      f"(global {state['steps']}) loss={rec['loss']:.5f} "
++                      f"lr={rec['lr']:.3g}", flush=True)
++                (state["out"] / "train_history.jsonl").write_text(
++                    "".join(json.dumps(r) + "\n" for r in state["train_history"]))
++            else:
++                v = evaluate(model, dev_loader, corpus, device, key)
++                state["dev_history"].append(
++                    {"stage": stage, "stage_step": step, "global_step": state["steps"],
++                     "lr": scheduler.get_last_lr()[0], key: v,
++                     "loss": float(loss.detach().float().item())})
++                improved = v > state["best"]
++                print(f"[stage {stage}] step {step}/{steps} (global {state['steps']}) "
++                      f"{key}={v:.4f} best={max(v, state['best']):.4f} "
++                      f"{'*' if improved else ''}", flush=True)
++                if improved:
++                    state["best"] = v
++                    state["best_stage"] = stage
++                    state["best_step"] = state["steps"]
++                    torch.save(model.state_dict(), state["out"] / "best.pth")
++                    since_improved = 0
++                else:
++                    since_improved += 1
++                if v > state["stage_best"]:
++                    state["stage_best"] = v
++                    torch.save(model.state_dict(), state["out"] / f"stage{stage}_best.pth")
++                (state["out"] / "dev_history.jsonl").write_text(
++                    "".join(json.dumps(r) + "\n" for r in state["dev_history"]))
++                if since_improved >= patience:
++                    print(f"[stage {stage}] early stop: {patience} evals without "
++                          f"improvement", flush=True)
++                    state["early_stopped"] = True
++                    break
++            if (time.time() - state["t_start"]) / 3600.0 > float(cfg["max_hours"]):
++                print(f"[stage {stage}] wall-clock ceiling "
++                      f"{cfg['max_hours']} h reached", flush=True)
++                state["wallclock_stop"] = True
++                break
++    state["stage_wall_h"].append((time.time() - t0) / 3600.0)
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--config", required=True)
++    ap.add_argument("--out", required=True)
++    ap.add_argument("overrides", nargs="*", default=[])
++    args = ap.parse_args()
++
++    cfg = load_config(args.config, args.overrides)
++    corpus = G.resolve(cfg["corpus"])
++    ccfg = G.CORPORA[corpus]
++    out = Path(args.out)
++    out.mkdir(parents=True, exist_ok=True)
++
++    if int(cfg["grad_accum"]) != 1:
++        raise SystemExit(
++            "grad_accum must be 1: the cloud prior has BatchNorm layers and is "
++            "trained in stage 2, so accumulation is not equivalent to a real batch")
++    if int(cfg["seed"]) not in list(cfg["seeds"]):
++        raise SystemExit(f"seed {cfg['seed']} is not in the configured seeds {cfg['seeds']}")
++    select = str(cfg["ckpt_selection"])
++    if select not in ("final", "best_on_dev"):
++        raise SystemExit(f"ckpt_selection must be 'final' or 'best_on_dev'; got {select!r}")
++    lr1, lr2 = (float(v) for v in cfg["lr_grid"][int(cfg["lr_point"])])
++
++    seed_everything(int(cfg["seed"]))
++    device = pick_device(cfg)
++    cudnn.benchmark = True
++
++    root = Path(cfg["root"]) if cfg.get("root") else ccfg["root"]
++    export_root = Path(cfg["export_root"]) if cfg.get("export_root") else None
++    train_split = str(cfg["train_split"])
++    src_tr = G.make_source(corpus, train_split, ccfg, root, export_root,
++                           cfg["source"], int(cfg["frame_index"]))
++    ids_tr = G.read_split(root, train_split, cfg["splits_dir"])
++    ids_te = G.read_split(root, "test", cfg["splits_dir"])
++    if len(set(ids_tr)) != len(ids_tr):
++        raise SystemExit(f"{train_split}.txt has {len(ids_tr) - len(set(ids_tr))} "
++                         f"duplicate ids -- refusing to run.")
++    if set(ids_tr) & set(ids_te):
++        raise SystemExit(f"{train_split} and test splits overlap -- refusing to "
++                         f"run.")
++
++    ds_tr = G.SplitPairs(src_tr, ids_tr, "train", int(cfg["patch_size_train"]))
++    gen = torch.Generator()
++    gen.manual_seed(int(cfg["seed"]))
++    train_loader = DataLoader(ds_tr, batch_size=int(cfg["batch_size"]), shuffle=True,
++                              drop_last=True, num_workers=int(cfg["num_works"]),
++                              pin_memory=True, generator=gen,
++                              persistent_workers=int(cfg["num_works"]) > 0)
++
++    ids_dv, dev_loader = [], None
++    if select == "best_on_dev":
++        ids_dv = G.read_split(root, "val", cfg["splits_dir"])
++        if set(ids_dv) & set(ids_te):
++            raise SystemExit(f"dev and test splits overlap on "
++                             f"{len(set(ids_dv) & set(ids_te))} ids -- checkpoint "
++                             f"selection would be on test. RULE B6.")
++        src_dv = G.make_source(corpus, "val", ccfg, root, export_root,
++                               cfg["source"], int(cfg["frame_index"]))
++        dev_loader = DataLoader(G.SplitPairs(src_dv, ids_dv, "eval"),
++                                batch_size=int(cfg["dev_batch_size"]),
++                                shuffle=False, drop_last=False,
++                                num_workers=int(cfg["num_works"]), pin_memory=True)
++
++    from torchvision.models import vgg16
++    vgg_model = vgg16(pretrained=True).features[:16]
++    for p in vgg_model.parameters():
++        p.requires_grad = False
++    loss_network = LossNetwork(vgg_model).to(device)
++    loss_network.eval()
++
++    S = int(cfg["steps"])
++    s1 = int(round(S * float(cfg["stage_split"])))
++    s2 = S - s1
++    eval_every = max(1, S // int(cfg["eval_divisor"]))
++
++    state = dict(corpus=corpus, dev_key=ccfg["dev_key"], out=out, best=-1e9,
++                 best_stage=0, best_step=0, stage_best=-1e9, steps=0, epochs=0,
++                 dev_history=[], train_history=[], ckpt_selection=select,
++                 early_stopped=False, wallclock_stop=False,
++                 loss_network=loss_network, eval_every=eval_every,
++                 t_start=time.time(), stage_wall_h=[])
++
++    print(f"[thiefcloud] corpus={corpus} device={device} "
++          f"source={getattr(src_tr, 'where', 'native-tif')} "
++          f"train_split={train_split} n_train={len(ids_tr)} n_dev={len(ids_dv)} "
++          f"steps={S} (stage1 {s1} / stage2 {s2}) batch={cfg['batch_size']} "
++          f"lr1={lr1:g} lr2={lr2:g} seed={cfg['seed']} "
++          f"log_every={eval_every} ckpt_selection={select} "
++          f"patience={cfg['patience_evals'] if select == 'best_on_dev' else 'n/a'}",
++          flush=True)
++
++    model = ThiefCloud().to(device)
++    params_total = sum(p.numel() for p in model.parameters())
++    state["stage_best"] = -1e9
++    run_stage(1, cfg, model, train_loader, dev_loader, device, lr1, s1, state)
++    if select == "final":
++        st1 = out / "stage1_last.pth"
++        torch.save(model.state_dict(), st1)
++    else:
++        st1 = out / "stage1_best.pth"
++        if not st1.is_file():
++            torch.save(model.state_dict(), st1)
++
++    last_model = model
++    if not (state["early_stopped"] and bool(cfg["stop_after_stage1"])):
++        state["early_stopped"] = False
++        state["stage_best"] = -1e9
++        model2 = ThiefCloud(swich=True).to(device)
++        model2.load_state_dict(torch.load(st1, map_location=device,
++                                          weights_only=True))
++        run_stage(2, cfg, model2, train_loader, dev_loader, device, lr2, s2, state)
++        last_model = model2
++
++    ckpt_path = out / ("final.pth" if select == "final" else "best.pth")
++    if select == "final":
++        torch.save(last_model.state_dict(), ckpt_path)
++
++    hist = [h for h in state["dev_history"]]
++    key = ccfg["dev_key"]
++    slope = None
++    if len(hist) >= 2:
++        cut = state["steps"] * 0.9
++        tail = [h for h in hist if h["global_step"] >= cut] or hist[-1:]
++        slope = float(hist[-1][key] - tail[0][key])
++    meta = {
++        "corpus": corpus, "method": "thiefcloud",
++        "method_variant": Path(args.config).name,
++        "seed": int(cfg["seed"]), "lr_point": int(cfg["lr_point"]),
++        "lr": [lr1, lr2], "batch_global": int(cfg["batch_size"]),
++        "microbatch": int(cfg["batch_size"]), "grad_accum": 1,
++        "steps_budget": S, "steps_used": state["steps"],
++        "epochs_used": round(state["steps"] * int(cfg["batch_size"]) / max(len(ids_tr), 1), 2),
++        "ceiling_hit": state["steps"] >= S,
++        "early_stopped": bool(state["early_stopped"]),
++        "wallclock_stop": bool(state["wallclock_stop"]),
++        "dev_metric": key if hist else None,
++        "dev_best": state["best"] if hist else None,
++        "dev_best_stage": state["best_stage"] if hist else None,
++        "dev_best_step": state["best_step"] if hist else None,
++        "dev_evaluations_consumed": len(hist),
++        "dev_slope_last10": slope,
++        "ckpt_selection": ("final" if select == "final"
++                           else "best_on_dev(raw; over both stages)"),
++        "ema": False,
++        "ckpt": ckpt_path.name,
++        "wall_clock_h": round((time.time() - state["t_start"]) / 3600.0, 4),
++        "stage_wall_h": [round(v, 4) for v in state["stage_wall_h"]],
++        "params_total": params_total, "params_trainable": params_total,
++        "gpu": torch.cuda.get_device_name(0) if device.type == "cuda" else "cpu",
++        "n_train": len(ids_tr), "n_dev": len(ids_dv), "n_test": len(ids_te),
++        "splits_dir": cfg["splits_dir"], "train_split": train_split,
++        "source": getattr(src_tr, "where", "native-tif"),
++        "frame_index": int(cfg["frame_index"]) if ccfg["kind"] == "sen2mtc" else None,
++        "config": cfg,
++    }
++    (out / "run_meta.json").write_text(json.dumps(meta, indent=2) + "\n")
++    if select == "final":
++        print(f"[thiefcloud] done. ckpt_selection=final (no dev split, no "
++              f"scored candidate); steps_used={state['steps']}/{S} "
++              f"epochs={meta['epochs_used']}; "
++              f"wrote {ckpt_path} and {out/'run_meta.json'}", flush=True)
++    else:
++        print(f"[thiefcloud] done. best {key}={state['best']:.4f} at global step "
++              f"{state['best_step']} (stage {state['best_stage']}); "
++              f"steps_used={state['steps']} epochs={meta['epochs_used']}; "
++              f"wrote {ckpt_path} and {out/'run_meta.json'}", flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/ThiefCloud/model.py b/ThiefCloud/model.py
+index c4b1f74..5afb65b 100644
+--- a/ThiefCloud/model.py
++++ b/ThiefCloud/model.py
+@@ -189,7 +189,10 @@ class ThiefCloud(nn.Module):
+         self.patch_embed = nn.Conv2d(in_channel, dim, kernel_size=to_2tuple(3), padding=1)
+ 
+         #Replace the model file which has trained in simulation data
+-        ckpt_path = "/home/zaq/Dehazing/CDModel/checkpointsCDNet_V1/best_CDNet_V1_SateHaze1k_sim2.pth"
++        if not ckpt_path:
++            ckpt_path = os.environ.get("THIEFCLOUD_SCPM_CKPT") or os.path.join(
++                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
++                "SCPM", "checkpointsCDNet_V1", "best_CDNet_V1_SateHaze1k.pth")
+ 
+ 
+         #cloud detection model SCPM
+@@ -197,7 +200,7 @@ class ThiefCloud(nn.Module):
+         if not self.swich:
+             frozen(self.cd)
+ 
+-        checkpoint_cd = torch.load(ckpt_path)
++        checkpoint_cd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+         model_dict_cd = self.cd.state_dict()
+         pretrained_dict = {k: v for k, v in checkpoint_cd["model_state"].items() if (k in model_dict_cd)}
+         model_dict_cd.update(pretrained_dict)
+diff --git a/ThiefCloud/test.py b/ThiefCloud/test.py
+index 52159f4..34287af 100644
+--- a/ThiefCloud/test.py
++++ b/ThiefCloud/test.py
+@@ -3,7 +3,7 @@ import sys
+ import torch
+ import argparse
+ from tqdm import tqdm
+-from model import EMDehamer
++from model import ThiefCloud
+ from utils import expand2square
+ import torch.nn.functional as F
+ from pytorch_msssim import ssim
+@@ -14,7 +14,7 @@ from torchvision.utils import save_image
+ 
+ def test(args):
+ 
+-    model_restoration = EMDehamer().cuda() if args.cuda else EMDehamer()
++    model_restoration = ThiefCloud().cuda() if args.cuda else ThiefCloud()
+ 
+     path_val_input, path_val_target = args.val_data + '/haze/', args.val_data + '/gt/'
+     datasetTest = MyTestDataSet(path_val_input, path_val_target)
+diff --git a/ThiefCloud/train.py b/ThiefCloud/train.py
+index c46302c..8c02e5f 100644
+--- a/ThiefCloud/train.py
++++ b/ThiefCloud/train.py
+@@ -18,7 +18,6 @@ from utils import expand2square
+ from pytorch_msssim import ssim
+ from torchvision.utils import save_image
+ 
+-os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+ 
+ 
+ def train(args):
+@@ -232,9 +231,9 @@ if __name__ == '__main__':
+     parser.add_argument('--lr_min', type=float, default=5e-7)
+     parser.add_argument('--train_data', type=str, default='/home/zaq/data/RICE/train')
+     parser.add_argument('--neg_save', type=str, default='/home/zaq/data/RICE/train/neg')
+-    parser.add_argument('--val_data', type=str, default='/home/zaq/data/RICE/test')
++    parser.add_argument('--val_data', type=str, default='')
+     parser.add_argument('--resume_state', type=str, default='./RICE_resume.pth')
+-    parser.add_argument('--pre_state', type=str, default='./RICE__pre.pth')
++    parser.add_argument('--pre_state', type=str, default='./stage1_pre.pth')
+     parser.add_argument('--save_state', type=str, default='./RICE_best.pth')
+     parser.add_argument('--cuda', type=bool, default=True)
+     parser.add_argument('--val_frequency', type=int, default=1)

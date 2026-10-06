@@ -1,0 +1,307 @@
+diff --git a/data/geocr_dataset.py b/data/geocr_dataset.py
+new file mode 100644
+index 0000000..0da7dc0
+--- /dev/null
++++ b/data/geocr_dataset.py
+@@ -0,0 +1,29 @@
++"""--dataset_mode geocr: cloudy (A) -> clear (B) training pairs read by split-list id.
++
++The transform is the repository's aligned recipe (one get_params draw shared by A and B)."""
++import geocr_data as G
++from data.base_dataset import BaseDataset, get_params, get_transform
++
++
++class GeocrDataset(BaseDataset):
++    @staticmethod
++    def modify_commandline_options(parser, is_train):
++        parser.add_argument("--corpus", type=str, required=True)
++        parser.add_argument("--export_root", type=str, default=str(G.CR_EXPORTS))
++        return parser
++
++    def __init__(self, opt):
++        BaseDataset.__init__(self, opt)
++        self.cfg = G.corpus_cfg(opt.corpus)
++        self.ids = G.read_split(self.cfg, "trainval")
++
++    def __len__(self):
++        return len(self.ids)
++
++    def __getitem__(self, index):
++        sid = self.ids[index]
++        A_img, B_img = G.load_pair_pil(self.cfg, "trainval", sid, self.opt.export_root)
++        params = get_params(self.opt, A_img.size)
++        A = get_transform(self.opt, params)(A_img)
++        B = get_transform(self.opt, params)(B_img)
++        return {"A": A, "B": B, "A_paths": sid, "B_paths": sid}
+diff --git a/dump.py b/dump.py
+new file mode 100644
+index 0000000..32b45ba
+--- /dev/null
++++ b/dump.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python
++"""Write test-set predictions for geocr.eval: <out>/preds/<id>.npy (float32 CHW in [0, 1],
++unclipped) and <out>/manifest.json.
++
++    python dump.py --config <configs/<corpus>.sh> --ckpt <dir with latest_net_G.pth> --out <dir>
++
++As in the repository's test.py, the generator stays in train mode (dropout active, batch
++normalisation on the statistics of a batch of one); the dropout noise is seeded per image from
++(seed, id), so the predictions do not depend on the order of the test set.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from pathlib import Path
++
++import numpy as np
++import torch
++
++import geocr_data as G
++import rescore as RS
++from train_geocr import parse_cfg, seed_all
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--config", required=True)
++    ap.add_argument("--ckpt", required=True, help="directory holding latest_net_G.pth")
++    ap.add_argument("--out", required=True)
++    ap.add_argument("--seed", type=int, default=0)
++    a = ap.parse_args()
++
++    cfg = parse_cfg(a.config)
++    ccfg = G.corpus_cfg(cfg["CORPUS"])
++    ids = G.read_split(ccfg, "test")
++    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
++    seed_all(a.seed)
++
++    from models import create_model
++    from options.test_options import TestOptions
++    ckpt = Path(a.ckpt).resolve()
++    sys.argv = ["dump.py", "--dataroot", str(G.CR_EXPORTS), "--name", ckpt.name,
++                "--checkpoints_dir", str(ckpt.parent), "--model", "pix2pix",
++                "--direction", "AtoB", "--dataset_mode", "geocr", "--corpus", cfg["CORPUS"],
++                "--epoch", "latest"]
++    opt = TestOptions().parse()
++    opt.device = device
++    opt.num_threads, opt.batch_size, opt.serial_batches, opt.no_flip = 0, 1, True, True
++    model = create_model(opt)
++    model.setup(opt)
++
++    preds = Path(a.out) / "preds"
++    preds.mkdir(parents=True, exist_ok=True)
++    with torch.no_grad():
++        for i, sid in enumerate(ids):
++            cy, _ = G.load_pair(ccfg, "test", sid)
++            A = (cy * 2.0 - 1.0)[None].to(device)
++            torch.manual_seed(G.keyed_seed(a.seed, sid))
++            model.set_input({"A": A, "B": A, "A_paths": [sid], "B_paths": [sid]})
++            model.test()
++            arr = ((model.fake_B[0].float().cpu() + 1.0) / 2.0).numpy().astype(np.float32)
++            np.save(preds / f"{Path(G.sid_flat(sid)).stem}.npy", arr)
++            if i % 100 == 0:
++                print(f"{i}/{len(ids)}", flush=True)
++
++    man = {"corpus": ccfg["corpus"], "split": "test",
++           "split_list_sha256": G.split_sha256(ccfg, "test"), "n_items": len(ids),
++           "resolution": list(ccfg["resolution"]), "crop": "none", "bands": list(ccfg["bands"]),
++           "domain": ccfg["domain"], "processing_level": ccfg["level"],
++           "ckpt_selection": "final", "train_split_sha256": G.split_sha256(ccfg, "trainval"),
++           "method": "pix2pix", "seed": a.seed,
++           "ckpt_sha256": RS.sha256_file(ckpt / "latest_net_G.pth")}
++    missing = [k for k in RS.IDENTITY_KEYS if k not in man]
++    if missing:
++        raise SystemExit(f"manifest lacks {missing}")
++    (Path(a.out) / "manifest.json").write_text(json.dumps(man, indent=2) + "\n")
++    print(f"{len(ids)} predictions -> {a.out}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/geocr_data.py b/geocr_data.py
+new file mode 100644
+index 0000000..9faf78a
+--- /dev/null
++++ b/geocr_data.py
+@@ -0,0 +1,56 @@
++"""GeoCR data adapter: ids from <dataset root>/splits/<split>.txt, pixels from the 8-bit RGB
++export <CR_EXPORTS>/<corpus>/<split>/{cloudy,clear}/<id>.png, paired by id."""
++from __future__ import annotations
++
++import hashlib
++import os
++from pathlib import Path
++
++import numpy as np
++import torch
++from PIL import Image
++
++import rescore as RS
++
++CR_EXPORTS = Path(os.environ.get("CR_EXPORTS", "CR_exports"))
++CORPORA = ("tcloud", "cuhk_cr2", "sen2mtc_new_rgb", "sen12mscr_rgb", "whus2crv_rgb")
++SPLITS_DIR = "splits"
++
++
++def corpus_cfg(name: str) -> dict:
++    if name not in CORPORA:
++        raise SystemExit(f"no pix2pix config for {name!r}; choose from {CORPORA}")
++    return dict(RS.CORPORA[name], corpus=name)
++
++
++def sid_flat(sid: str) -> str:
++    return sid.replace("/", "__")
++
++
++def read_split(cfg: dict, split: str) -> list[str]:
++    return RS.read_split(Path(cfg["root"]), split, SPLITS_DIR)
++
++
++def split_sha256(cfg: dict, split: str) -> str:
++    return RS.sha256_file(Path(cfg["root"]) / SPLITS_DIR / f"{split}.txt")
++
++
++def load_pair_pil(cfg: dict, split: str, sid: str, export_root=None):
++    root = Path(export_root or CR_EXPORTS) / cfg["corpus"] / split
++    name = Path(sid_flat(sid)).with_suffix(".png").name
++    return (Image.open(root / "cloudy" / name).convert("RGB"),
++            Image.open(root / "clear" / name).convert("RGB"))
++
++
++def load_pair(cfg: dict, split: str, sid: str, export_root=None):
++    """(cloudy, clear) as float32 CHW in [0, 1]."""
++    f = lambda im: torch.from_numpy(  # noqa: E731
++        np.ascontiguousarray(np.asarray(im, dtype=np.uint8).transpose(2, 0, 1))).float() / 255.0
++    cy, cl = load_pair_pil(cfg, split, sid, export_root)
++    return f(cy), f(cl)
++
++
++def keyed_seed(seed: int, sid: str) -> int:
++    """Per-sample seed for the test-time dropout noise: blake2b of (seed, id)."""
++    key = hashlib.blake2b(f"{seed}:{sid}".encode(), digest_size=8).digest()
++    return int.from_bytes(key, "big") % (2 ** 63)
+diff --git a/train_geocr.py b/train_geocr.py
+new file mode 100644
+index 0000000..6a71ad7
+--- /dev/null
++++ b/train_geocr.py
+@@ -0,0 +1,115 @@
++#!/usr/bin/env python
++"""Train pix2pix for exactly S_D updates (one D and one G step per batch of B_D) on trainval.
++
++    python train_geocr.py --config <configs/<corpus>.sh> --seed 0 --out runs
++
++The model, losses, optimizers and the 'linear' LR policy are the repository's own; the epoch
++horizon is derived from S_D (constant LR for the first half of the epochs, linear decay over the
++second half). Writes <out>/<corpus>_pix2pix_seed<N>/latest_net_{G,D}.pth.
++"""
++from __future__ import annotations
++
++import argparse
++import math
++import random
++import sys
++import time
++from pathlib import Path
++
++import numpy as np
++import torch
++from torch.utils.data import DataLoader
++
++import geocr_data as G
++
++
++def parse_cfg(path) -> dict[str, str]:
++    """configs/<corpus>.sh holds flat KEY="value" lines."""
++    cfg = {}
++    for ln in Path(path).read_text().splitlines():
++        ln = ln.strip()
++        if ln and not ln.startswith("#") and "=" in ln:
++            k, v = ln.split("=", 1)
++            cfg[k] = v.strip().strip('"')
++    return cfg
++
++
++def seed_all(seed: int) -> None:
++    random.seed(seed)
++    np.random.seed(seed)
++    torch.manual_seed(seed)
++    if torch.cuda.is_available():
++        torch.cuda.manual_seed_all(seed)
++
++
++def _worker_init(worker_id: int) -> None:
++    wseed = torch.initial_seed() % (2 ** 32)
++    random.seed(wseed)
++    np.random.seed(wseed)
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--config", required=True)
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--out", default="runs")
++    a = ap.parse_args()
++
++    cfg = parse_cfg(a.config)
++    s_d, b_d = int(cfg["S_D"]), int(cfg["B_D"])
++    seed_all(a.seed)
++    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
++    if device.type == "cuda":
++        torch.cuda.set_device(0)
++
++    from options.train_options import TrainOptions
++    name = f"{cfg['CORPUS']}_pix2pix_seed{a.seed}"
++    sys.argv = ["train_geocr.py", "--dataroot", str(G.CR_EXPORTS), "--name", name,
++                "--checkpoints_dir", a.out, "--model", "pix2pix", "--direction", "AtoB",
++                "--dataset_mode", "geocr", "--corpus", cfg["CORPUS"], "--batch_size", cfg["B_D"],
++                "--lr", cfg["LR"], "--num_threads", cfg["NUM_THREADS"], "--no_html"]
++    opt = TrainOptions().parse()
++    opt.device = device
++
++    from data import find_dataset_using_name
++    ds = find_dataset_using_name("geocr")(opt)
++    steps_per_epoch = len(ds) // b_d
++    e_tot = math.ceil(s_d / steps_per_epoch)
++    opt.n_epochs = e_tot // 2
++    opt.n_epochs_decay = e_tot - opt.n_epochs
++    print(f"{cfg['CORPUS']} seed={a.seed} n_train={len(ds)} steps/epoch={steps_per_epoch} "
++          f"epochs={opt.n_epochs}+{opt.n_epochs_decay} lr={opt.lr}")
++
++    from models import create_model
++    model = create_model(opt)
++    model.setup(opt)
++
++    loader_g = torch.Generator()
++    t0, step, epoch = time.time(), 0, opt.epoch_count
++    while step < s_d:
++        loader_g.manual_seed(a.seed * 1_000_003 + epoch)
++        loader = DataLoader(ds, batch_size=b_d, shuffle=True, drop_last=True,
++                            num_workers=int(opt.num_threads), generator=loader_g,
++                            worker_init_fn=_worker_init)
++        for data in loader:
++            model.set_input(data)
++            model.optimize_parameters()
++            step += 1
++            if step % 200 == 0 or step == s_d:
++                losses = " ".join(f"{k}={v:.4f}" for k, v in model.get_current_losses().items())
++                print(f"[{step}/{s_d}] ep{epoch} {losses} ({time.time() - t0:.0f}s)", flush=True)
++            if step >= s_d:
++                break
++        else:
++            model.update_learning_rate()
++            epoch += 1
++            continue
++        break
++
++    model.save_networks("latest")
++    print(f"{step} updates -> {Path(a.out) / name}/latest_net_G.pth")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

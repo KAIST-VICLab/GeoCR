@@ -1,0 +1,140 @@
+model:
+  base_learning_rate: 1.00e-04
+  target: sgm.models.diffusion.ResidualDiffusionEngine
+  params:
+    input_key: "target"
+    mean_key: "S2"
+    compile_model: False
+    use_ema: True
+    use_flash_attn2: False
+    image_metrics: "metrics"
+    dump_dir: "${oc.env:EMRDM_DUMP_ROOT,dumps}/whus2crv/test/emrdm/${oc.env:EMRDM_RUN_ID,RUN_ID_UNSET}"
+    dump_dtype: "float32"
+
+    sigma_st_config:
+      target: sgm.modules.diffusionmodules.sigma2st.EDMSigma2St
+      params:
+        alpha: 3.0
+
+    denoiser_config:
+      target: sgm.modules.diffusionmodules.denoiser.ResidualDenoiser
+      params:
+        scaling_config:
+          target: sgm.modules.diffusionmodules.denoiser_scaling.ResidualEDMScaling
+          params:
+            sigma_input: 1.0
+            sigma_mu: 1.0
+
+    network_wrapper: "sgm.modules.diffusionmodules.wrappers.CloudRemovalWrapper"
+
+    network_config:
+      target: sgm.modules.diffusionmodules.k_diffusion.image_transformer.ImageTransformerDenoiserModelInterface
+      params:
+        in_channels: 26
+        out_channels: 13
+        patch_size: [1,1]
+        widths: [128,256,384,768]
+        depths: [2,2,2,2]
+        d_ffs: [256,512,768,1536]
+        self_attns: [
+            {"type": "neighborhood", "d_head": 64, "kernel_size": 7},
+            {"type": "neighborhood", "d_head": 64, "kernel_size": 7},
+            {"type": "global", "d_head": 64},
+            {"type": "global", "d_head": 64},
+        ]
+        dropout_rate: [0.0,0.0,0.0,0.1]
+        mapping_depth: 2
+        mapping_width: 768
+        mapping_d_ff: 1536
+        mapping_dropout_rate: 0.1
+
+    conditioner_config:
+      target: sgm.modules.GeneralConditioner
+      params:
+        emb_models:
+          - is_trainable: True
+            input_key: "S2"
+            ucg_rate: 0.0
+            target: sgm.modules.encoders.modules.IndentityEmbedder
+
+    first_stage_config:
+      target: sgm.models.autoencoder.IdentityFirstStage
+
+    loss_fn_config:
+      target: sgm.modules.diffusionmodules.loss.ResidualDiffusionLoss
+      params:
+        loss_weighting_config:
+          target: sgm.modules.diffusionmodules.loss_weighting.ResidualEDMWeighting
+          params:
+            sigma_input: 1.0
+            sigma_mu: 1.0
+        sigma_sampler_config:
+          target: sgm.modules.diffusionmodules.sigma_sampling.EDMSampling
+          params:
+            p_mean: -1.2
+            p_std: 1.2
+
+    sampler_config:
+      target: sgm.modules.diffusionmodules.sampling.ResidualEulerEDMSampler
+      params:
+        num_steps: 5
+        s_churn: 5.0
+        s_tmin: 0.0
+        s_tmax: 100000000.0
+        s_noise: 1.023
+
+        discretization_config:
+          target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
+          params:
+            sigma_min: 0.001
+            sigma_max: 100.0
+
+    to_rgb_config:
+      target: sgm.util.S1andS2_to_rgb
+
+data:
+  target: sgm.data.base.DataModuleFromConfig
+  params:
+    batch_size: 8
+    num_workers: 8
+    wrap: True
+    train:
+      target: geocr_bench.datasets.WHUS2SplitDataset
+      params:
+        root: "${oc.env:CR_DATASETS}/WHUS2-CRv/extracted"
+        split: "trainval"
+        splits_dir: "splits"
+    test:
+      target: geocr_bench.datasets.WHUS2SplitDataset
+      params:
+        root: "${oc.env:CR_DATASETS}/WHUS2-CRv/extracted"
+        split: "test"
+        splits_dir: "splits"
+    predict:
+      target: geocr_bench.datasets.WHUS2SplitDataset
+      params:
+        root: "${oc.env:CR_DATASETS}/WHUS2-CRv/extracted"
+        split: "test"
+        splits_dir: "splits"
+
+lightning:
+  modelcheckpoint:
+    params:
+      monitor: null
+      save_top_k: 0
+      save_last: True
+      every_n_train_steps: 2500
+
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        disabled: True
+
+  trainer:
+    devices: "0,"
+    num_sanity_val_steps: 0
+    benchmark: True
+    accumulate_grad_batches: 1
+    max_steps: 61485
+    max_epochs: -1

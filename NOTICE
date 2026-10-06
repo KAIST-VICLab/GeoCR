@@ -1,0 +1,40 @@
+GeoCR: Learning a Generalist Cloud Removal Prior from Heterogeneous Observations
+Copyright 2026 Jeonghyeok Do and Munchurl Kim (KAIST)
+
+This product includes software developed by the authors above, licensed under the
+Apache License, Version 2.0 (see LICENSE).
+
+The model weights are not covered by LICENSE; see LICENSE-WEIGHTS.md.
+
+
+Third-party code
+----------------
+
+FLUX.2 (Black Forest Labs), Apache License 2.0
+https://huggingface.co/black-forest-labs/FLUX.2-klein-base-4B
+
+  geocr/models/flux2.py      Transformer blocks, modulation, normalisation, rotary position
+                             embedding and timestep embedding of FLUX.2. MODIFIED: only the
+                             components used by GeoCR are kept.
+  geocr/models/flux2_ae.py   The FLUX.2 autoencoder. MODIFIED: the encoder returns the
+                             posterior mean, packed 2x2 space-to-depth and normalised by the
+                             shipped BatchNorm statistics; the module is always frozen.
+  geocr/models/multistem_ae.py
+                             Input and output stems placed around the frozen FLUX.2
+                             autoencoder trunks.
+  geocr/models/geocr_dit.py  The GeoCR flow transformer, built from the blocks above and
+                             initialised from FLUX.2 [klein] 4B Base for pretraining.
+
+
+Third-party weights
+-------------------
+
+  vae/ae.safetensors (Hugging Face repository JeonghyeokDo/GeoCR)
+      The FLUX.2 autoencoder of black-forest-labs/FLUX.2-klein-base-4B (Apache-2.0),
+      stored in the FLUX.2 layout at fp32.
+
+  transformer/ (Hugging Face repository JeonghyeokDo/GeoCR)
+      Pretrained by the authors, starting from FLUX.2 [klein] 4B Base (Apache-2.0).
+
+Apache-2.0 Section 6 withholds trademark rights. GeoCR is not a FLUX product and is
+not endorsed by Black Forest Labs.

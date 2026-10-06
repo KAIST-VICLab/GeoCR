@@ -1,0 +1,375 @@
+diff --git a/dump.py b/dump.py
+new file mode 100644
+index 0000000..ce7d966
+--- /dev/null
++++ b/dump.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python
++"""Write test-set predictions for geocr.eval: <out>/preds/<id>.npy (float32 CHW in [0, 1],
++unclipped) and <out>/manifest.json.
++
++    python dump.py --corpus <corpus> --config <configs/<corpus>_s2.yml> \
++        --ckpt <dir with net_g_latest.pth, net_le_dm_latest.pth, net_d_latest.pth> --out <dir>
++
++The stage-2 model runs in test mode: net_le_dm encodes the cloudy image, the prior is denoised
++over the configured timesteps (posterior mean) from noise seeded per image from (seed, id), and
++net_g restores the image. The stage-1 encoder net_le is not used at test time.
++"""
++import argparse
++import json
++from pathlib import Path
++
++import numpy as np
++import torch
++import yaml
++from torch.utils.data import DataLoader
++
++import geocr_data as G
++import rescore as RS
++
++
++def build_model(cfg_path: Path, ckpt: Path, num_gpu: int):
++    import hi_diff  # noqa: F401  (registers the archs and models)
++    from hi_diff.models.HI_Diff_S2_model import HI_Diff_S2
++    from hi_diff.utils.options import ordered_yaml
++    with open(cfg_path, encoding="utf-8") as f:
++        opt = yaml.load(f, Loader=ordered_yaml()[0])
++    opt.update(is_train=False, dist=False, rank=0, world_size=1, num_gpu=num_gpu)
++    opt["path"]["pretrain_network_le"] = None
++    for key in ("g", "le_dm", "d"):
++        opt["path"][f"pretrain_network_{key}"] = str(ckpt / f"net_{key}_latest.pth")
++        opt["path"][f"strict_load_{key}"] = True
++        opt["path"][f"param_key_{key}"] = "params"
++    model = HI_Diff_S2(opt)
++    for net in (model.net_g, model.net_le, model.net_le_dm, model.net_d):
++        net.eval()
++    return model
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--corpus", required=True)
++    ap.add_argument("--config", required=True, help="the stage-2 config")
++    ap.add_argument("--ckpt", required=True, help="directory holding the stage-2 net_*_latest.pth")
++    ap.add_argument("--out", required=True)
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--batch-size", type=int, default=8)
++    ap.add_argument("--num-workers", type=int, default=4)
++    a = ap.parse_args()
++
++    ds = G.GeoCRPairs(a.corpus, "test")
++    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    ckpt = Path(a.ckpt)
++    model = build_model(Path(a.config), ckpt, num_gpu=int(device.type == "cuda"))
++
++    preds = Path(a.out) / "preds"
++    preds.mkdir(parents=True, exist_ok=True)
++    loader = DataLoader(ds, batch_size=a.batch_size, shuffle=False, num_workers=a.num_workers)
++    with torch.no_grad():
++        for cloudy, _clear, sids in loader:
++            img = cloudy.to(device)
++            prior_c = model.net_le_dm(img)
++            noise = torch.stack([G.sample_noise(s, tuple(prior_c.shape[1:]), a.seed) for s in sids]
++                                ).to(device=device, dtype=prior_c.dtype)
++            out = model.net_g(img, model.p_sample_loop(prior_c, noise))
++            for arr, sid in zip(out.float().cpu().numpy(), sids):
++                np.save(preds / f"{Path(G.sid_flat(sid)).stem}.npy", np.asarray(arr, dtype=np.float32))
++
++    cfg = ds.cfg
++    man = {"corpus": cfg["corpus"], "split": "test",
++           "split_list_sha256": G.split_sha256(cfg, "test"), "n_items": len(ds),
++           "resolution": list(cfg["resolution"]), "crop": "none", "bands": list(cfg["bands"]),
++           "domain": cfg["domain"], "processing_level": cfg["level"],
++           "ckpt_selection": "final", "train_split_sha256": G.split_sha256(cfg, "trainval"),
++           "method": "hidiff", "seed": a.seed,
++           "ckpt_sha256": RS.sha256_file(ckpt / "net_g_latest.pth")}
++    missing = [k for k in RS.IDENTITY_KEYS if k not in man]
++    if missing:
++        raise SystemExit(f"manifest lacks {missing}")
++    (Path(a.out) / "manifest.json").write_text(json.dumps(man, indent=2) + "\n")
++    print(f"{len(ds)} predictions -> {a.out}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/geocr_data.py b/geocr_data.py
+new file mode 100644
+index 0000000..047a921
+--- /dev/null
++++ b/geocr_data.py
+@@ -0,0 +1,64 @@
++"""GeoCR data adapter for the test split: ids from <dataset root>/splits/test.txt, pixels from the
++8-bit RGB export <CR_EXPORTS>/<corpus>/test/{cloudy,clear}/<id>.png. Training reads the same export
++through PairedImageIRDataset (configs/<corpus>_s{1,2}.yml)."""
++from __future__ import annotations
++
++import hashlib
++import os
++from pathlib import Path
++
++import cv2
++import numpy as np
++import torch
++from torch.utils.data import Dataset
++
++import rescore as RS
++
++CR_EXPORTS = Path(os.environ.get("CR_EXPORTS", "CR_exports"))
++CORPORA = ("tcloud", "cuhk_cr2", "sen2mtc_new_rgb", "sen12mscr_rgb", "whus2crv_rgb")
++SPLITS_DIR = "splits"
++
++
++def corpus_cfg(name: str) -> dict:
++    if name not in CORPORA:
++        raise SystemExit(f"no HI-Diff config for {name!r}; choose from {CORPORA}")
++    return dict(RS.CORPORA[name], corpus=name)
++
++
++def sid_flat(sid: str) -> str:
++    return sid.replace("/", "__")
++
++
++def split_sha256(cfg: dict, split: str) -> str:
++    return RS.sha256_file(Path(cfg["root"]) / SPLITS_DIR / f"{split}.txt")
++
++
++def sample_noise(sid: str, shape, seed: int) -> torch.Tensor:
++    """Initial prior noise for one sample, from a generator seeded with blake2b of (seed, id)."""
++    key = hashlib.blake2b(f"{seed}:{sid}".encode(), digest_size=8).digest()
++    g = torch.Generator(device="cpu").manual_seed(int.from_bytes(key, "big"))
++    return torch.randn(*shape, generator=g, dtype=torch.float32)
++
++
++class GeoCRPairs(Dataset):
++    """Items are (cloudy, clear, id) with float32 RGB tensors [3, 256, 256] in [0, 1]."""
++
++    def __init__(self, corpus: str, split: str):
++        self.cfg = corpus_cfg(corpus)
++        self.export = CR_EXPORTS / corpus / split
++        self.sids = RS.read_split(Path(self.cfg["root"]), split, SPLITS_DIR)
++
++    def __len__(self) -> int:
++        return len(self.sids)
++
++    def _png(self, role: str, sid: str) -> torch.Tensor:
++        p = self.export / role / Path(sid_flat(sid)).with_suffix(".png").name
++        a = cv2.imread(str(p), cv2.IMREAD_COLOR)
++        if a is None:
++            raise FileNotFoundError(p)
++        a = a[:, :, ::-1]
++        return torch.from_numpy(np.ascontiguousarray(a.transpose(2, 0, 1), dtype=np.float32) / 255.0)
++
++    def __getitem__(self, idx: int):
++        sid = self.sids[idx]
++        return self._png("cloudy", sid), self._png("clear", sid), sid
+diff --git a/hi_diff/models/HI_Diff_S1_model.py b/hi_diff/models/HI_Diff_S1_model.py
+index 5a93989..5893631 100644
+--- a/hi_diff/models/HI_Diff_S1_model.py
++++ b/hi_diff/models/HI_Diff_S1_model.py
+@@ -108,29 +108,43 @@ class HI_Diff_S1(BaseModel):
+             self.gt = data['gt'].to(self.device)
+ 
+     def optimize_parameters(self, current_iter):
+-        self.optimizer_total.zero_grad()
+-
+-        prior = self.net_le(self.lq, self.gt)
+-        self.output = self.net_g(self.lq, prior)
++        # train.micro_batch: run forward/backward in equal chunks (loss scaled by 1/n_chunks) and
++        # take one optimizer step for the whole batch; unset, the loop runs once.
++        micro = int(self.opt['train'].get('micro_batch') or 0)
++        bsz = self.lq.shape[0]
++        if micro <= 0 or micro >= bsz:
++            micro = bsz
++        if bsz % micro != 0:
++            raise ValueError(f'batch {bsz} is not divisible by micro_batch {micro}')
++        n_chunks = bsz // micro
+ 
+-        l_total = 0
++        self.optimizer_total.zero_grad()
+         loss_dict = OrderedDict()
+-        # pixel loss
+-        if self.cri_pix:
+-            l_pix = self.cri_pix(self.output, self.gt)
+-            l_total += l_pix
+-            loss_dict['l_pix'] = l_pix
+-        # perceptual loss
+-        if self.cri_perceptual:
+-            l_percep, l_style = self.cri_perceptual(self.output, self.gt)
+-            if l_percep is not None:
+-                l_total += l_percep
+-                loss_dict['l_percep'] = l_percep
+-            if l_style is not None:
+-                l_total += l_style
+-                loss_dict['l_style'] = l_style
+-
+-        l_total.backward()
++        for i0 in range(0, bsz, micro):
++            lq = self.lq[i0:i0 + micro]
++            gt = self.gt[i0:i0 + micro]
++
++            prior = self.net_le(lq, gt)
++            self.output = self.net_g(lq, prior)
++
++            l_total = 0
++            # pixel loss
++            if self.cri_pix:
++                l_pix = self.cri_pix(self.output, gt)
++                l_total += l_pix
++                loss_dict['l_pix'] = loss_dict.get('l_pix', 0) + l_pix.detach() / n_chunks
++            # perceptual loss
++            if self.cri_perceptual:
++                l_percep, l_style = self.cri_perceptual(self.output, gt)
++                if l_percep is not None:
++                    l_total += l_percep
++                    loss_dict['l_percep'] = loss_dict.get('l_percep', 0) + l_percep.detach() / n_chunks
++                if l_style is not None:
++                    l_total += l_style
++                    loss_dict['l_style'] = loss_dict.get('l_style', 0) + l_style.detach() / n_chunks
++
++            (l_total / n_chunks).backward()
++
+         if self.opt['train']['use_grad_clip']:
+             torch.nn.utils.clip_grad_norm_(list(self.net_le.parameters()) + list(self.net_g.parameters()), 0.01)
+         self.optimizer_total.step()
+diff --git a/hi_diff/models/HI_Diff_S2_model.py b/hi_diff/models/HI_Diff_S2_model.py
+index c474d41..9ed25ef 100644
+--- a/hi_diff/models/HI_Diff_S2_model.py
++++ b/hi_diff/models/HI_Diff_S2_model.py
+@@ -277,51 +277,67 @@ class HI_Diff_S2(BaseModel):
+         # freeze c1 (cpen_s1)
+         for p in self.net_le.parameters():
+             p.requires_grad = False
+-        
+-        self.optimizer_total.zero_grad()
+-        prior_z = self.net_le(self.lq, self.gt)
+ 
+-        if self.apply_ldm:
+-            prior, _=self.diffusion(self.lq, prior_z)
+-        else:
+-            prior_d = self.net_le_dm(self.lq)
+-            # diffusion-forward
+-            t = self.opt['diffusion_schedule']['timesteps']
+-            # [b, 4c']
+-            noise = default(noise, lambda: torch.randn_like(prior_z))
+-            # sample xt/x_noisy (from x0/x_start)
+-            prior_noisy = self.q_sample(
+-                x_start=prior_z, sqrt_alpha_cumprod=self.alphas_cumprod[t-1],
+-                noise=noise)
+-            # diffusion-reverse
+-            prior = self.p_sample_loop_wo_variance(prior_d, prior_noisy)
+-
+-        # ir
+-        self.output = self.net_g(self.lq, prior)
+-
+-        l_total = 0
++        # train.micro_batch: run forward/backward in equal chunks (loss scaled by 1/n_chunks) and
++        # take one optimizer step for the whole batch; unset, the loop runs once.
++        micro = int(self.opt['train'].get('micro_batch') or 0)
++        bsz = self.lq.shape[0]
++        if micro <= 0 or micro >= bsz:
++            micro = bsz
++        if bsz % micro != 0:
++            raise ValueError(f'batch {bsz} is not divisible by micro_batch {micro}')
++        n_chunks = bsz // micro
++
++        self.optimizer_total.zero_grad()
+         loss_dict = OrderedDict()
+-        # pixel loss
+-        if self.cri_pix:
+-            l_pix = self.cri_pix(self.output, self.gt)
+-            l_total += l_pix
+-            loss_dict['l_pix'] = l_pix
+-        if self.cri_pix_diff:
+-            l_pix_diff = self.cri_pix_diff(prior_z, prior)
+-            l_total += l_pix_diff
+-            loss_dict['l_pix_diff'] = l_pix_diff
+-
+-        # perceptual loss
+-        if self.cri_perceptual:
+-            l_percep, l_style = self.cri_perceptual(self.output, self.gt)
+-            if l_percep is not None:
+-                l_total += l_percep
+-                loss_dict['l_percep'] = l_percep
+-            if l_style is not None:
+-                l_total += l_style
+-                loss_dict['l_style'] = l_style
+-
+-        l_total.backward()
++        for i0 in range(0, bsz, micro):
++            lq = self.lq[i0:i0 + micro]
++            gt = self.gt[i0:i0 + micro]
++            chunk_noise = noise[i0:i0 + micro] if noise is not None else None
++
++            prior_z = self.net_le(lq, gt)
++
++            if self.apply_ldm:
++                prior, _ = self.diffusion(lq, prior_z)
++            else:
++                prior_d = self.net_le_dm(lq)
++                # diffusion-forward
++                t = self.opt['diffusion_schedule']['timesteps']
++                # [b, 4c']
++                chunk_noise = default(chunk_noise, lambda: torch.randn_like(prior_z))
++                # sample xt/x_noisy (from x0/x_start)
++                prior_noisy = self.q_sample(
++                    x_start=prior_z, sqrt_alpha_cumprod=self.alphas_cumprod[t-1],
++                    noise=chunk_noise)
++                # diffusion-reverse
++                prior = self.p_sample_loop_wo_variance(prior_d, prior_noisy)
++
++            # ir
++            self.output = self.net_g(lq, prior)
++
++            l_total = 0
++            # pixel loss
++            if self.cri_pix:
++                l_pix = self.cri_pix(self.output, gt)
++                l_total += l_pix
++                loss_dict['l_pix'] = loss_dict.get('l_pix', 0) + l_pix.detach() / n_chunks
++            if self.cri_pix_diff:
++                l_pix_diff = self.cri_pix_diff(prior_z, prior)
++                l_total += l_pix_diff
++                loss_dict['l_pix_diff'] = loss_dict.get('l_pix_diff', 0) + l_pix_diff.detach() / n_chunks
++
++            # perceptual loss
++            if self.cri_perceptual:
++                l_percep, l_style = self.cri_perceptual(self.output, gt)
++                if l_percep is not None:
++                    l_total += l_percep
++                    loss_dict['l_percep'] = loss_dict.get('l_percep', 0) + l_percep.detach() / n_chunks
++                if l_style is not None:
++                    l_total += l_style
++                    loss_dict['l_style'] = loss_dict.get('l_style', 0) + l_style.detach() / n_chunks
++
++            (l_total / n_chunks).backward()
++
+         if self.opt['train']['use_grad_clip']:
+             if self.apply_ldm:
+                 torch.nn.utils.clip_grad_norm_(list(self.net_g.parameters()) + list(self.diffusion.parameters()), 0.01)
+diff --git a/hi_diff/utils/base_model.py b/hi_diff/utils/base_model.py
+index 8fe1c39..c302324 100644
+--- a/hi_diff/utils/base_model.py
++++ b/hi_diff/utils/base_model.py
+@@ -291,7 +291,7 @@ class BaseModel(nn.Module):
+         """
+         logger = get_root_logger()
+         net = self.get_bare_model(net)
+-        load_net = torch.load(load_path, map_location=lambda storage, loc: storage)
++        load_net = torch.load(load_path, map_location=lambda storage, loc: storage, weights_only=False)
+         if param_key is not None:
+             if param_key not in load_net and 'params' in load_net:
+                 param_key = 'params'
+diff --git a/train.py b/train.py
+index 5b9b369..ea62353 100644
+--- a/train.py
++++ b/train.py
+@@ -89,7 +89,7 @@ def load_resume_state(opt):
+         resume_state = None
+     else:
+         device_id = torch.cuda.current_device()
+-        resume_state = torch.load(resume_state_path, map_location=lambda storage, loc: storage.cuda(device_id))
++        resume_state = torch.load(resume_state_path, map_location=lambda storage, loc: storage.cuda(device_id), weights_only=False)
+         check_resume(opt, resume_state['iter'])
+     return resume_state
+ 

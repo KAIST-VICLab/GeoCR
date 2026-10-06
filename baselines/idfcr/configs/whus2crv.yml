@@ -1,0 +1,38 @@
+corpus: whus2crv
+source: native
+export_root: ${CR_EXPORTS}
+dumps_root: ${OUT}/dumps
+out_dir: ${OUT}/runs/whus2crv
+
+max_steps: 50000
+batchsize: 16
+validation_batchsize: 16
+train_split: trainval
+ckpt_selection: final
+ckpt_every: 1250
+epoch: 39
+lr: 0.0004
+lr_grid: [0.0004]
+seeds: [0]
+manualSeed: 0
+width_10: 384
+height_10: 384
+width_20: 192
+height_20: 192
+width_60: 64
+height_60: 64
+in_ch_10: 4
+in_ch_20: 6
+in_ch_60: 3
+
+cuda: true
+gpu_ids: []
+threads: 8
+beta1: 0.5
+lamb: 100
+in_ch: 3
+out_ch: 3
+minimax: 1
+gen_init:
+dis_init:
+snapshot_interval: 20

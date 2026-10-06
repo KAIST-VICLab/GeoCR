@@ -1,0 +1,705 @@
+diff --git a/core/dpm_solver_pytorch.py b/core/dpm_solver_pytorch.py
+index 2989698..b664c03 100644
+--- a/core/dpm_solver_pytorch.py
++++ b/core/dpm_solver_pytorch.py
+@@ -290,7 +290,7 @@ def model_wrapper(
+             return output
+         elif model_type == "x_start":
+             alpha_t, sigma_t = noise_schedule.marginal_alpha(t_continuous), noise_schedule.marginal_std(t_continuous)
+-            return (x - alpha_t * output) / sigma_t
++            return (x - expand_dims(alpha_t, x.dim()) * output) / expand_dims(sigma_t, x.dim())
+         elif model_type == "v":
+             alpha_t, sigma_t = noise_schedule.marginal_alpha(t_continuous), noise_schedule.marginal_std(t_continuous)
+             return alpha_t * output + sigma_t * x
+@@ -437,7 +437,7 @@ class DPM_Solver:
+         """
+         noise = self.noise_prediction_fn(x, t)
+         alpha_t, sigma_t = self.noise_schedule.marginal_alpha(t), self.noise_schedule.marginal_std(t)
+-        x0 = (x - sigma_t * noise) / alpha_t
++        x0 = (x - expand_dims(sigma_t, x.dim()) * noise) / expand_dims(alpha_t, x.dim())
+         if self.correcting_x0_fn is not None:
+             x0 = self.correcting_x0_fn(x0, t)
+         return x0
+diff --git a/core/logger.py b/core/logger.py
+index b5070b0..3ff4f39 100644
+--- a/core/logger.py
++++ b/core/logger.py
+@@ -152,17 +152,17 @@ class LogTracker:
+     """
+     def __init__(self, *keys, phase='train'):
+         self.phase = phase
+-        self._data = pd.DataFrame(index=keys, columns=['total', 'counts', 'average'])
++        self._data = pd.DataFrame(index=keys, columns=['total', 'counts', 'average'], dtype=float)
+         self.reset()
+ 
+     def reset(self):
+         for col in self._data.columns:
+-            self._data[col].values[:] = 0
++            self._data[col] = 0.0
+ 
+     def update(self, key, value, n=1):
+-        self._data.total[key] += value * n
+-        self._data.counts[key] += n
+-        self._data.average[key] = self._data.total[key] / self._data.counts[key]
++        self._data.loc[key, 'total'] += value * n
++        self._data.loc[key, 'counts'] += n
++        self._data.loc[key, 'average'] = self._data.loc[key, 'total'] / self._data.loc[key, 'counts']
+ 
+     def avg(self, key):
+         return self._data.average[key]
+diff --git a/core/praser.py b/core/praser.py
+index 0106d33..6408fd4 100644
+--- a/core/praser.py
++++ b/core/praser.py
+@@ -7,6 +7,44 @@ from functools import partial
+ import importlib
+ from types  import FunctionType
+ import shutil
++
++
++def _descend(node, k, key):
++    """One step of a dotted path. Lists are indexed by integer (``optimizers.0``)."""
++    if isinstance(node, list):
++        try:
++            return node[int(k)]
++        except (ValueError, IndexError):
++            raise KeyError(f'-o {key}: {k!r} is not a valid list index') from None
++    if k not in node:
++        raise KeyError(f'-o {key}: no such config path (at {k!r})')
++    return node[k]
++
++
++def apply_overrides(opt, overrides):
++    """Apply ``-o dotted.key=value`` overrides (values parsed as JSON, else kept as
++    strings). Creating a new key is refused."""
++    for item in overrides or []:
++        if '=' not in item:
++            raise ValueError(f'-o expects key.path=value, got {item!r}')
++        key, _, raw = item.partition('=')
++        try:
++            val = json.loads(raw)
++        except json.JSONDecodeError:
++            val = raw
++        node, parts = opt, key.split('.')
++        for k in parts[:-1]:
++            node = _descend(node, k, key)
++        last = parts[-1]
++        if isinstance(node, list):
++            node[int(last)] = val
++        else:
++            if last not in node:
++                raise KeyError(f'-o {key}: no such config key {last!r}')
++            node[last] = val
++    return opt
++
++
+ def init_obj(opt, logger, *args, default_file_name='default file', given_module=None, init_type='Network', **modify_kwargs):
+     """
+     finds a function handle with the name given as 'name' in config,
+@@ -102,6 +140,9 @@ def parse(args):
+             json_str += line
+     opt = json.loads(json_str, object_pairs_hook=OrderedDict)
+ 
++    ''' apply -o overrides before anything reads the config '''
++    opt = apply_overrides(opt, getattr(args, 'override', None))
++
+     ''' replace the config context using args '''
+     opt['phase'] = args.phase
+     if args.gpu_ids is not None:
+@@ -141,7 +182,9 @@ def parse(args):
+     if 'debug' in opt['name']:
+         opt['train'].update(opt['debug'])
+ 
+-    ''' code backup ''' 
++    ''' code backup '''
++    if os.environ.get('DIFFCR_NO_CODE_BACKUP', '') not in ('', '0'):
++        return dict_to_nonedict(opt)
+     for name in os.listdir('.'):
+         if name in ['config', 'models', 'core', 'slurm', 'data']:
+             shutil.copytree(name, os.path.join(opt['path']['code'], name), ignore=shutil.ignore_patterns("*.pyc", "__pycache__"))
+diff --git a/data/geocr_dataset.py b/data/geocr_dataset.py
+new file mode 100644
+index 0000000..a0e3056
+--- /dev/null
++++ b/data/geocr_dataset.py
+@@ -0,0 +1,160 @@
++"""Split-list dataset for DiffCR (T-CLOUD, CUHK-CR1/2, Sen2_MTC_New)."""
++from __future__ import annotations
++
++import hashlib
++import os
++import sys
++from pathlib import Path
++
++import numpy as np
++import torch
++import torch.utils.data as data
++
++GEOCR_ROOT = Path(os.environ.get("GEOCR_ROOT", Path(__file__).resolve().parents[2] / "GeoCR"))
++
++
++def _geocr():
++    if str(GEOCR_ROOT) not in sys.path:
++        sys.path.insert(0, str(GEOCR_ROOT))
++    try:
++        from geocr.data.benchmarks import _read_png, _read_tif, _resize_u8
++    except Exception as exc:
++        raise SystemExit(
++            f"cannot import geocr.data.benchmarks from {GEOCR_ROOT}: {exc}; set GEOCR_ROOT"
++        ) from exc
++    return _read_png, _read_tif, _resize_u8
++
++
++CORPORA = {
++    "tcloud":      ("display8", [("/cloud/", "/reference/"), ("/cloud/", "/label/")], False),
++    "cuhk_cr1":    ("display8", [("/cloud/", "/label/")], True),
++    "cuhk_cr2":    ("display8", [("/cloud/", "/label/")], False),
++    "sen2mtc_new": ("boa4", [], False),
++}
++ALIASES = {"cuhk_cr": "cuhk_cr1"}
++
++
++def sid_flat(sid: str) -> str:
++    return sid.replace("/", "__")
++
++
++def dump_stem(sid: str) -> str:
++    return Path(sid_flat(sid)).stem
++
++
++def read_split(root: Path, split: str, splits_dir: str) -> list[str]:
++    p = Path(root) / splits_dir / f"{split}.txt"
++    if not p.is_file():
++        raise SystemExit(f"missing split file {p}")
++    out = [s for s in (ln.split("#", 1)[0].strip()
++                       for ln in p.read_text().splitlines()) if s]
++    if not out:
++        raise SystemExit(f"{p} is empty")
++    return out
++
++
++class GeoCRSplitDataset(data.Dataset):
++
++    def __init__(self, corpus: str, root: str, split: str, splits_dir: str = "splits",
++                 resolution: int = 256, bands: int = 3, augment: bool = False,
++                 nir_root: str | None = None, mode: str | None = None,
++                 limit: int = 0):
++        corpus = ALIASES.get(corpus, corpus)
++        if corpus not in CORPORA:
++            raise SystemExit(f"unknown corpus {corpus!r}; have {sorted(CORPORA)}")
++        split = split or mode
++        self.corpus, self.level = corpus, CORPORA[corpus][0]
++        self.clear_sub, self.has_nir = CORPORA[corpus][1], CORPORA[corpus][2]
++        self.root = Path(root)
++        self.split, self.splits_dir = split, splits_dir
++        self.resolution, self.bands = int(resolution), int(bands)
++        self.augment = bool(augment) and split in ("train", "trainval")
++        if self.bands == 4 and not self.has_nir:
++            raise SystemExit(f"{corpus} has no NIR tree; bands must be 3")
++        self.nir_root = (Path(nir_root) if nir_root else
++                         self.root.parent / "nir" / self.root.name)
++        self.sids = read_split(self.root, split, splits_dir)
++        if limit:
++            print(f"[geocr_dataset] WARNING limit={limit}: using {limit} of "
++                  f"{len(self.sids)} {self.corpus}/{split} ids")
++            self.sids = self.sids[:limit]
++        self.k = 3 if self.level == "boa4" else 1
++        self._read_png, self._read_tif, self._resize_u8 = _geocr()
++        self._calls, self._salt = 0, None
++
++    def _clear_path(self, sid: str) -> Path:
++        if self.level == "boa4":
++            return self.root / sid
++        for needle, repl in self.clear_sub:
++            if needle in sid:
++                cand = self.root / sid.replace(needle, repl)
++                if cand.is_file():
++                    return cand
++        raise FileNotFoundError(f"{self.corpus}: no clear pair for {sid}")
++
++    def _cond_paths(self, sid: str) -> list[Path]:
++        if self.level == "boa4":
++            stem = Path(sid).stem
++            d = self.root / Path(sid).parent.parent / "cloud"
++            return [d / f"{stem}_{i}.tif" for i in range(3)]
++        return [self.root / sid]
++
++    def _canonical(self, path: Path, sid_for_nir: str | None) -> np.ndarray:
++        if self.level == "boa4":
++            arr = self._read_tif(path).astype(np.float32) / 10000.0
++            return arr[:3]
++        rgb = self._resize_u8(self._read_png(path), self.resolution)
++        out = rgb[..., :3].astype(np.float32).transpose(2, 0, 1) / 255.0
++        if self.bands == 4:
++            nir = self._read_png(self.nir_root / sid_for_nir)
++            nir = self._resize_u8(nir[..., 0] if nir.ndim == 3 else nir,
++                                  self.resolution).astype(np.float32) / 255.0
++            out = np.concatenate([out, nir[None]], axis=0)
++        return out
++
++    def _aug_params(self, sid: str) -> tuple[int, int]:
++        if self._salt is None:
++            self._salt = torch.initial_seed() & 0xFFFFFFFF
++        h = hashlib.blake2b(f"{self._salt}|{self._calls}|{sid}".encode(),
++                            digest_size=8).digest()
++        self._calls += 1
++        r = np.random.default_rng(int.from_bytes(h, "big"))
++        return int(r.integers(0, 3)), int(r.integers(0, 4))
++
++    @staticmethod
++    def _apply_aug(a: np.ndarray, flip: int, rot: int) -> np.ndarray:
++        if flip:
++            a = np.flip(a, flip)
++        if rot:
++            a = np.rot90(a, rot, (1, 2))
++        return np.ascontiguousarray(a)
++
++    def __len__(self) -> int:
++        return len(self.sids)
++
++    def __getitem__(self, index: int) -> dict:
++        sid = self.sids[index]
++        clear = self._canonical(self._clear_path(sid),
++                                self._clear_sid(sid) if self.bands == 4 else None)
++        conds = [self._canonical(p, sid) for p in self._cond_paths(sid)]
++        if len(conds) == 1:
++            conds = conds * 3
++        if self.augment:
++            flip, rot = self._aug_params(sid)
++            clear = self._apply_aug(clear, flip, rot)
++            conds = [self._apply_aug(c, flip, rot) for c in conds]
++        def to_model(a):
++            t = torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32))
++            return t * 2.0 - 1.0
++        return {
++            "gt_image": to_model(clear),
++            "cond_image": torch.cat([to_model(c) for c in conds], dim=0),
++            "path": dump_stem(sid) + ".png",
++            "sid": sid,
++        }
++
++    def _clear_sid(self, sid: str) -> str:
++        for needle, repl in self.clear_sub:
++            if needle in sid:
++                return sid.replace(needle, repl)
++        return sid
+diff --git a/dump_geocr.py b/dump_geocr.py
+new file mode 100644
+index 0000000..e860385
+--- /dev/null
++++ b/dump_geocr.py
+@@ -0,0 +1,212 @@
++#!/usr/bin/env python
++"""Write DiffCR predictions (DPM-Solver++, per-sample keyed noise) as CHW .npy files plus a manifest."""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import subprocess
++import sys
++import time
++from collections import OrderedDict
++from pathlib import Path
++
++import numpy as np
++import torch
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++
++from core.praser import apply_overrides
++from data.geocr_dataset import GeoCRSplitDataset, dump_stem
++from models.geocr_model import keyed_noise
++from models.network_x0_dpm_solver import Network
++
++
++def load_config(path: str, overrides) -> dict:
++    txt = "".join(l.split("//")[0] + "\n" for l in open(path))
++    return apply_overrides(json.loads(txt, object_pairs_hook=OrderedDict), overrides)
++
++
++def sha256_file(p: Path) -> str:
++    h = hashlib.sha256()
++    with open(p, "rb") as fh:
++        for c in iter(lambda: fh.read(1 << 20), b""):
++            h.update(c)
++    return h.hexdigest()
++
++
++def build_net(opt: dict, device) -> Network:
++    net_opt = opt["model"]["which_networks"][0]["args"]
++    net = Network(unet=dict(net_opt["unet"]),
++                  beta_schedule=net_opt["beta_schedule"],
++                  module_name=net_opt["module_name"])
++    net.set_new_noise_schedule(device=device, phase="test")
++    return net.to(device).eval()
++
++
++def load_ckpt(net: Network, ckpt: Path) -> dict:
++    sd = torch.load(ckpt, map_location="cpu", weights_only=True)
++    sub = {k[len("denoise_fn."):]: v for k, v in sd.items()
++           if k.startswith("denoise_fn.")}
++    if not sub:
++        raise SystemExit(f"{ckpt}: no denoise_fn.* tensors; not a DiffCR "
++                         f"checkpoint (found e.g. {list(sd)[:3]})")
++    net.denoise_fn.load_state_dict(sub, strict=True)
++    return {"tensors_loaded": len(sub),
++            "keys_ignored": sorted(k for k in sd if not k.startswith("denoise_fn."))}
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("-c", "--config", required=True)
++    ap.add_argument("-o", "--override", action="append", default=[])
++    ap.add_argument("--ckpt", default=None,
++                    help="…/final_Network.pth or pretrained/diffcr_new.pth")
++    ap.add_argument("--baseline", choices=("copy",), default=None,
++                    help="write the cloudy input as the prediction (no model)")
++    ap.add_argument("--split", default="test")
++    ap.add_argument("--run-id", required=True, help="YYYYMMDD_<sha>_seed<N>")
++    ap.add_argument("--method", default=None, help="dump dir name; default from config")
++    ap.add_argument("--batch-size", type=int, default=16)
++    ap.add_argument("--noise", choices=("keyed", "global"), default="keyed")
++    ap.add_argument("--noise-seed", type=int, default=0, help="--noise global only")
++    ap.add_argument("--dump-root", default=None)
++    ap.add_argument("--train-summary", default=None,
++                    help="train_summary.json from the run; copied into the manifest")
++    ap.add_argument("--limit", type=int, default=0, help="predict only the first N ids (testing)")
++    ap.add_argument("--dry-run", action="store_true")
++    a = ap.parse_args()
++
++    opt = load_config(a.config, a.override)
++    g = opt["geocr"]
++    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++
++    ds_args = dict(opt["datasets"][a.split]["which_dataset"]["args"])
++    ds_args.update(split=a.split, augment=False)
++    ds = GeoCRSplitDataset(**ds_args)
++    if a.limit:
++        ds.sids = ds.sids[:a.limit]
++    bands = int(ds_args.get("bands", 3))
++    out_ch = 4 if (g["corpus"] == "sen2mtc_new" and bands == 3) else bands
++
++    root = Path(a.dump_root or opt["path"]["dump_root"])
++    method = a.method or g["method"]
++    run = root / g["corpus"] / a.split / method / a.run_id
++    print(f"corpus={g['corpus']} split={a.split} n={len(ds)} bands={bands} "
++          f"-> {out_ch}ch  dump={run}")
++    if a.dry_run:
++        print("[dry-run] would write "
++              f"{len(ds)} .npy ({len(ds) * out_ch * ds.resolution ** 2 * 4 / 1e6:.1f} MB)"
++              " + manifest.json")
++        return 0
++
++    if a.baseline:
++        net, ck = None, {"tensors_loaded": 0, "keys_ignored": []}
++    else:
++        if not a.ckpt:
++            raise SystemExit("--ckpt is required unless --baseline is given")
++        net = build_net(opt, dev)
++        ck = load_ckpt(net, Path(a.ckpt))
++        print(f"loaded {ck['tensors_loaded']} tensors strict=True from {a.ckpt}; "
++              f"ignored non-denoise_fn keys: {ck['keys_ignored'] or 'none'}")
++
++    (run / "preds").mkdir(parents=True, exist_ok=True)
++    loader = torch.utils.data.DataLoader(ds, batch_size=a.batch_size, shuffle=False,
++                                         num_workers=4, drop_last=False)
++    if a.noise == "global":
++        torch.manual_seed(a.noise_seed)
++    t0, written = time.time(), []
++    with torch.no_grad():
++        for d in loader:
++            cond, gt = d["cond_image"].to(dev), d["gt_image"].to(dev)
++            if a.baseline == "copy":
++                out = cond[:, :gt.shape[1]]
++            else:
++                y_t = (keyed_noise(d["sid"], gt.shape[1:], gt.dtype, dev)
++                       if a.noise == "keyed" else torch.randn_like(gt))
++                out, _ = net.restoration(cond, y_t=y_t, y_0=gt,
++                                         sample_num=opt["model"]["which_model"]["args"]["sample_num"])
++            canon = ((out.float() + 1.0) / 2.0).cpu().numpy()
++            for i, sid in enumerate(d["sid"]):
++                arr = canon[i].astype(np.float32)
++                if out_ch > arr.shape[0]:
++                    pad = np.full((out_ch - arr.shape[0], *arr.shape[1:]),
++                                  np.nan, dtype=np.float32)
++                    arr = np.concatenate([arr, pad], axis=0)
++                stem = dump_stem(sid)
++                np.save(run / "preds" / f"{stem}.npy", arr)
++                written.append(stem)
++            print(f"  {len(written)}/{len(ds)}", end="\r", flush=True)
++
++    expect = [dump_stem(s) for s in ds.sids]
++    if sorted(written) != sorted(expect):
++        raise SystemExit(f"{run}: wrote {len(written)} keys but the split has "
++                         f"{len(expect)}; refusing to write a manifest")
++    if len(set(written)) != len(written):
++        raise SystemExit(f"{run}: duplicate stems -- ids collide after '/'->'__'")
++
++    split_file = Path(ds.root) / ds.splits_dir / f"{a.split}.txt"
++    man = {
++        "corpus": g["corpus"], "split": a.split,
++        "split_list": str(split_file), "split_list_sha256": sha256_file(split_file),
++        "n_items": len(expect),
++        "resolution": [ds.resolution, ds.resolution],
++        "native_resolution": g.get("native_resolution"),
++        "resample": g.get("resample"), "crop": "none",
++        "bands": g["bands"], "bands_predicted": g["bands"][:bands],
++        "domain": g["domain"], "dtype": "float32",
++        "processing_level": g["processing_level"],
++        "method": method, "method_variant": Path(a.config).name,
++        "code_rev": git_rev(), "code_patches": g.get("code_patches", []),
++        "ckpt": str(a.ckpt) if a.ckpt else f"baseline:{a.baseline}",
++        "ckpt_sha256": sha256_file(Path(a.ckpt)) if a.ckpt else None,
++        "ckpt_tensors_loaded": ck["tensors_loaded"],
++        "ckpt_selection": g.get("ckpt_selection"),
++        "train_split_sha256": (
++            sha256_file(Path(ds.root) / ds.splits_dir / f"{g['train_split']}.txt")
++            if g.get("train_split") else
++            f"released:{sha256_file(Path(a.ckpt))[:16]}" if a.ckpt
++            else "released:unknown"),
++        "seed": opt["seed"],
++        "sampler": ({"type": f"baseline:{a.baseline}", "nfe": 0}
++                    if a.baseline else
++                    {"type": "dpmsolver++", "nfe": 21, "steps": 20, "order": 2,
++                     "correcting_x0_fn": "dynamic_thresholding",
++                     "noise": a.noise, "noise_seed":
++                         (a.noise_seed if a.noise == "global" else "blake2b(sid)")}),
++        "frames_used": ds.k, "frame_rule": g["frame_rule"],
++        "sar_used": False, "sar_fill": "n/a",
++        "surgery": g.get("surgery"),
++        "dump_seconds": round(time.time() - t0, 1),
++        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
++        "limit_applied": a.limit or None,
++    }
++    if a.train_summary and Path(a.train_summary).is_file():
++        ts = json.loads(Path(a.train_summary).read_text())
++        ts.pop("dev_history", None)
++        declared, actual = g.get("ckpt_selection"), ts.get("ckpt_selection")
++        if declared and actual != declared:
++            raise SystemExit(
++                f"{a.train_summary}: ckpt_selection={actual!r}, but "
++                f"{Path(a.config).name} declares {declared!r}; refusing to write a manifest.")
++        man.update({k: v for k, v in ts.items() if k not in ("corpus", "bands")})
++    elif not a.limit:
++        man["training"] = ("none (copy baseline)" if a.baseline else
++                          "none (released checkpoint / inference-only row)")
++    (run / "manifest.json").write_text(json.dumps(man, indent=2) + "\n")
++    print(f"\nwrote {len(expect)} preds + manifest.json in "
++          f"{man['dump_seconds']}s -> {run}")
++    return 0
++
++
++def git_rev() -> str:
++    try:
++        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
++                                       cwd=Path(__file__).resolve().parent,
++                                       text=True).strip()
++    except Exception:
++        return "unknown"
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/models/geocr_model.py b/models/geocr_model.py
+new file mode 100644
+index 0000000..52a95e9
+--- /dev/null
++++ b/models/geocr_model.py
+@@ -0,0 +1,156 @@
++"""DiffCR (Palette) training for a fixed number of optimizer steps; writes final_Network.pth."""
++from __future__ import annotations
++
++import hashlib
++import json
++import time
++from pathlib import Path
++
++import torch
++import tqdm
++
++from models.model import Palette
++
++UNSUPPORTED_BUDGET_KEYS = ("eval_every", "patience", "dev_eval_ema")
++
++
++def keyed_noise(sids, shape, dtype, device) -> torch.Tensor:
++    outs = []
++    for sid in sids:
++        h = hashlib.blake2b(str(sid).encode(), digest_size=8).digest()
++        g = torch.Generator().manual_seed(int.from_bytes(h, "big") % (2 ** 63))
++        outs.append(torch.randn(shape, generator=g, dtype=torch.float32))
++    return torch.stack(outs).to(device=device, dtype=dtype)
++
++
++def bare(net):
++    return net.module if hasattr(net, "module") else net
++
++
++def sha256_file(p: Path) -> str:
++    h = hashlib.sha256()
++    with open(p, "rb") as fh:
++        for c in iter(lambda: fh.read(1 << 20), b""):
++            h.update(c)
++    return h.hexdigest()
++
++
++class PaletteGeoCR(Palette):
++
++    def __init__(self, budget=None, **kwargs):
++        super().__init__(**kwargs)
++        if not budget:
++            raise SystemExit("PaletteGeoCR requires a `budget` block in model.which_model.args")
++        self.b = dict(budget)
++        stale = [k for k in UNSUPPORTED_BUDGET_KEYS if k in self.b]
++        if stale:
++            raise SystemExit(
++                f"budget carries unsupported key(s) {stale}; expected corpus/bands/steps/"
++                "global_batch/ckpt_selection/weights")
++        sel = str(self.b.get("ckpt_selection", "final"))
++        if sel != "final":
++            raise SystemExit(
++                f"budget.ckpt_selection = {sel!r}; only 'final' is supported")
++        self.weights = str(self.b.get("weights", "raw"))
++        if self.weights not in ("raw", "ema"):
++            raise SystemExit(f"budget.weights = {self.weights!r}; expected "
++                             "'raw' (DiffCR's own default) or 'ema'")
++        if self.weights == "ema" and self.ema_scheduler is None:
++            raise SystemExit("budget.weights = 'ema' but the config has no "
++                             "model.which_model.args.ema_scheduler")
++        self.logger.info(
++            "training split = "
++            f"{getattr(self.phase_loader.dataset, 'split', '?')}; "
++            f"checkpoint = final at step {int(self.b['steps'])}; weights = {self.weights}")
++
++    def _save_rolling(self, step: int) -> None:
++        out = Path(self.opt["path"]["checkpoint"])
++        out.mkdir(parents=True, exist_ok=True)
++        tmp = out / "rolling_ckpt.pth.tmp"
++        torch.save({"step": step, "epoch": self.epoch, "iter": self.iter,
++                    "netG": bare(self.netG).state_dict(),
++                    "netG_EMA": (bare(self.netG_EMA).state_dict()
++                                 if self.netG_EMA is not None else None),
++                    "optG": self.optG.state_dict()}, tmp)
++        tmp.replace(out / "rolling_ckpt.pth")
++        self.logger.info(f"[ckpt] rolling_ckpt.pth @ step {step}")
++
++    def _save_final(self, step: int) -> None:
++        net = bare(self.netG_EMA if self.weights == "ema" else self.netG)
++        sd = {k: v.detach().cpu() for k, v in net.state_dict().items()
++              if k.startswith("denoise_fn.")}
++        out = Path(self.opt["path"]["checkpoint"])
++        out.mkdir(parents=True, exist_ok=True)
++        torch.save(sd, out / "final_Network.pth")
++        (out / "final_meta.json").write_text(json.dumps(
++            {"ckpt_selection": "final",
++             "step": step, "steps_ceiling": int(self.b["steps"]),
++             "weights": self.weights, "tensors": len(sd)},
++            indent=2) + "\n")
++        self.logger.info(f"[ckpt] final_Network.pth: {len(sd)} tensors, "
++                         f"{self.weights} weights, step {step}")
++
++    def train(self):
++        S = int(self.b["steps"])
++        step, t0 = 0, time.time()
++        self.netG.train()
++        while step < S:
++            self.epoch += 1
++            self.train_metrics.reset()
++            for d in tqdm.tqdm(self.phase_loader, desc=f"epoch {self.epoch}"):
++                if step >= S:
++                    break
++                self.set_input(d)
++                self.optG.zero_grad()
++                loss = self.netG(self.gt_image, self.cond_image, mask=self.mask)
++                loss.backward()
++                self.optG.step()
++                step += 1
++                self.iter += self.batch_size
++                self.train_metrics.update(self.loss_fn.__name__, loss.item())
++                if self.ema_scheduler is not None and \
++                        self.iter > self.ema_scheduler["ema_start"] and \
++                        self.iter % self.ema_scheduler["ema_iter"] == 0:
++                    self.EMA.update_model_average(self.netG_EMA, self.netG)
++                ce = int(self.b.get("ckpt_every", 0))
++                if ce > 0 and step % ce == 0 and step < S:
++                    self._save_rolling(step)
++                if step % max(int(self.opt["train"]["log_iter"]), 1) == 0:
++                    self.writer.set_iter(self.epoch, step, phase="train")
++                    for k, v in self.train_metrics.result().items():
++                        self.logger.info(f"step {step} {k}: {v}")
++                        self.writer.add_scalar(k, v)
++        self._save_final(step)
++        self._summarise(step, time.time() - t0)
++
++    def _summarise(self, step, secs) -> None:
++        ds = self.phase_loader.dataset
++        n_train = len(ds)
++        bg = int(self.b["global_batch"])
++        split_file = Path(ds.root) / ds.splits_dir / f"{ds.split}.txt"
++        summary = {
++            "corpus": self.b["corpus"], "bands": int(self.b.get("bands", 3)),
++            "steps_used": step, "steps_ceiling": int(self.b["steps"]),
++            "ceiling_hit": step >= int(self.b["steps"]),
++            "stop_reason": "ceiling",
++            "batch_global": bg, "microbatch": bg, "grad_accum": 1,
++            "samples_seen": step * bg,
++            "epochs_used": round(step * bg / max(n_train, 1), 2),
++            "n_train": n_train,
++            "train_split": ds.split,
++            "train_split_file": str(split_file),
++            "train_split_sha256": sha256_file(split_file),
++            "lr": self.optG.param_groups[0]["lr"],
++            "seed": self.opt["seed"],
++            "ckpt_selection": "final",
++            "ckpt_weights": self.weights,
++            "dev_evaluations_consumed": 0,
++            "dev_slope_last10": None,
++            "ema_decay": (self.ema_scheduler or {}).get("ema_decay"),
++            "wall_clock_h": round(secs / 3600.0, 3),
++            "params_trainable": sum(p.numel() for p in self.netG.parameters()
++                                    if p.requires_grad),
++        }
++        p = Path(self.opt["path"]["experiments_root"]) / "train_summary.json"
++        p.write_text(json.dumps(summary, indent=2) + "\n")
++        self.logger.info(f"[summary] {json.dumps(summary)}")
+diff --git a/models/network_x0_dpm_solver.py b/models/network_x0_dpm_solver.py
+index 93f9eaa..e1460f6 100644
+--- a/models/network_x0_dpm_solver.py
++++ b/models/network_x0_dpm_solver.py
+@@ -44,7 +44,7 @@ class Network(BaseNetwork):
+         elif module_name == "ours_concat_no_condskip_nodrop_noparams_splitca_double_encoder_decoder_middle_fusion":
+             from .ours.ours_concat_no_condskip_nodrop_noparams_splitca_double_encoder_decoder_middle_fusion import UNet
+         elif module_name == "ours_double_encoder_splitcaCond_splitcaUnet":
+-            from .ours.ours_double_encoder_splitcaCond_splitcaUnet import UNet
++            from .ours.nafnet_double_encoder_splitcaCond_splitcaUnet import UNet
+         elif module_name == "ours_double_encoder_splitcaCond":
+             from .ours.ours_double_encoder_splitcaCond import UNet
+         elif module_name == "ours_double_encoder_splitcaUnet":
+diff --git a/models/ours/nafnet_double_encoder_splitcaCond_splitcaUnet.py b/models/ours/nafnet_double_encoder_splitcaCond_splitcaUnet.py
+index 336d290..02c92f3 100644
+--- a/models/ours/nafnet_double_encoder_splitcaCond_splitcaUnet.py
++++ b/models/ours/nafnet_double_encoder_splitcaCond_splitcaUnet.py
+@@ -271,7 +271,7 @@ class UNet(nn.Module):
+                                bias=True)
+         self.cond_intro = nn.Conv2d(in_channels=img_channel, out_channels=width, kernel_size=3, padding=1, stride=1, groups=1,
+                                bias=True)
+-        self.ending = nn.Conv2d(in_channels=width, out_channels=3, kernel_size=3, padding=1, stride=1, groups=1,
++        self.ending = nn.Conv2d(in_channels=width, out_channels=img_channel, kernel_size=3, padding=1, stride=1, groups=1,
+                                 bias=True)
+         # self.inp_ending = nn.Conv2d(in_channels=img_channel, out_channels=3, kernel_size=3, padding=1, stride=1, groups=1,
+         #                             bias=True)
+diff --git a/run.py b/run.py
+index b36f94c..cfa9548 100644
+--- a/run.py
++++ b/run.py
+@@ -70,6 +70,9 @@ if __name__ == '__main__':
+     parser.add_argument('-gpu', '--gpu_ids', type=str, default=None)
+     parser.add_argument('-d', '--debug', action='store_true')
+     parser.add_argument('-P', '--port', default='21012', type=str)
++    parser.add_argument('-o', '--override', action='append', default=[],
++                        metavar='KEY.PATH=VALUE',
++                        help='dotted config override; repeatable')
+ 
+     ''' parser configs '''
+     args = parser.parse_args()

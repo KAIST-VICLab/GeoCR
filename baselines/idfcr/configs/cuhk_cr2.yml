@@ -1,0 +1,31 @@
+corpus: cuhk_cr2
+source: native
+export_root: ${CR_EXPORTS}
+dumps_root: ${OUT}/dumps
+out_dir: ${OUT}/runs/cuhk_cr2
+
+max_steps: 80000
+batchsize: 4
+validation_batchsize: 32
+train_split: trainval
+ckpt_selection: final
+ckpt_every: 250
+epoch: 715
+lr: 0.0004
+lr_grid: [0.0004]
+seeds: [0, 1, 2]
+manualSeed: 0
+width: 256
+height: 256
+
+cuda: true
+gpu_ids: []
+threads: 8
+beta1: 0.5
+lamb: 100
+in_ch: 3
+out_ch: 3
+minimax: 1
+gen_init:
+dis_init:
+snapshot_interval: 10

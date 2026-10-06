@@ -1,0 +1,1063 @@
+diff --git a/pixel/WHUS2/allnet.py b/pixel/WHUS2/allnet.py
+index bd133a1..5e71044 100644
+--- a/pixel/WHUS2/allnet.py
++++ b/pixel/WHUS2/allnet.py
+@@ -84,10 +84,10 @@ def liner_2(input_):  # 2%线性拉伸,返回0~1之间的值
+ 
+ 
+ def make_test_data_list(data_path):  # make_train_data_list函数得到训练中的x域和y域的图像路径名称列表
+-    filepath = glob.glob(os.path.join(data_path, "*"))  # 读取全部的x域图像路径名称列表
++    filepath = sorted(glob.glob(os.path.join(data_path, "*")))
+     image_path_lists = []
+     for i in range(len(filepath)):
+-        path = glob.glob(os.path.join(filepath[i], "*"))
++        path = sorted(glob.glob(os.path.join(filepath[i], "*")))
+         for j in range(len(path)):
+             image_path_lists.append(path[j])
+     return image_path_lists
+diff --git a/pixel/WHUS2/gdaldiy.py b/pixel/WHUS2/gdaldiy.py
+index b07fb10..1621af3 100644
+--- a/pixel/WHUS2/gdaldiy.py
++++ b/pixel/WHUS2/gdaldiy.py
+@@ -5,53 +5,23 @@ Created on Fri Oct 25 20:57:37 2019
+ @author: Neoooli
+ """
+ 
+-try:
+-    import gdal
+-except:
+-    from osgeo import gdal
+ import numpy as np
+-
+-list1 = ["byte", "uint8", "uint16", "int16", "uint32", "int32", "float32", "float64", "cint16", "cint32", "cfloat32",
+-         "cfloat64"]
+-list2 = [gdal.GDT_Byte, gdal.GDT_Byte, gdal.GDT_UInt16, gdal.GDT_Int16, gdal.GDT_UInt32, gdal.GDT_Int32,
+-         gdal.GDT_Float32, gdal.GDT_Float64, gdal.GDT_CInt16, gdal.GDT_CInt32, gdal.GDT_CFloat32, gdal.GDT_CFloat64]
++import tifffile
+ 
+ 
+ def imgread(path):
+-    img = gdal.Open(path)
+-    # col = img.RasterXSize #col
+-    # row = img.RasterYSize #row
+-    # img_arr = img.ReadAsArray(0,0,col,row) #设置读取图像的范围(宽/高)
+-    c = img.RasterCount
+-    img_arr = img.ReadAsArray()  # 读取整幅图像
+-    if c > 1:
+-        img_arr = img_arr.swapaxes(1, 0)
+-        img_arr = img_arr.swapaxes(2, 1)
+-    del img
++    """GeoTIFF -> HWC array (upstream returned HWC via two swapaxes)."""
++    img_arr = tifffile.imread(str(path))
++    if img_arr.ndim == 3 and img_arr.shape[0] < img_arr.shape[-1]:
++        img_arr = np.moveaxis(img_arr, 0, -1)
+     return img_arr
+ 
+ 
+ def imgwrite(path, narray, compress="None"):
+-    s = narray.shape
+-    dt_name = narray.dtype.name
+-    for i in range(len(list1)):
+-        if list1[i] in dt_name.lower():
+-            datatype = list2[i]
+-            break
+-        else:
+-            datatype = list2[0]
+-    if len(s) == 2:
+-        row, col, c = s[0], s[1], 1
+-        driver = gdal.GetDriverByName('GTiff')
+-        dataset = driver.Create(path, col, row, c, datatype, options=["COMPRESS=" + compress])  # GDAL存储为宽/长/波段->列/行/通道
+-        dataset.GetRasterBand(1).WriteArray(narray)
+-        del dataset
+-    elif len(s) == 3:
+-        row, col, c = s[0], s[1], s[2]
+-        driver = gdal.GetDriverByName('GTiff')
+-        dataset = driver.Create(path, col, row, c, datatype)
+-        for i in range(c):
+-            dataset.GetRasterBand(i + 1).WriteArray(narray[:, :, i])
+-        del dataset
++    """HWC (or HW) array -> GeoTIFF. `compress` is accepted for call-site
++    compatibility; "None" means uncompressed, anything else is passed to
++    tifffile as its compression name."""
++    comp = None if str(compress).lower() in ("none", "", "0") else compress
++    tifffile.imwrite(str(path), np.ascontiguousarray(narray), compression=comp)
+ 
+ 
+diff --git a/pixel/attrdict.py b/pixel/attrdict.py
+new file mode 100644
+index 0000000..bd6b1a7
+--- /dev/null
++++ b/pixel/attrdict.py
+@@ -0,0 +1,23 @@
++"""Minimal stand-in for the `attrdict` package, which does not import on Python >= 3.10."""
++
++
++class AttrMap(dict):
++    def __init__(self, mapping=None, **kw):
++        super().__init__()
++        for k, v in dict(mapping or {}, **kw).items():
++            self[k] = AttrMap(v) if isinstance(v, dict) else v
++
++    def __getattr__(self, name):
++        try:
++            return self[name]
++        except KeyError:
++            raise AttributeError(name) from None
++
++    def __setattr__(self, name, value):
++        self[name] = AttrMap(value) if isinstance(value, dict) else value
++
++    def __delattr__(self, name):
++        try:
++            del self[name]
++        except KeyError:
++            raise AttributeError(name) from None
+diff --git a/pixel/dump_geocr.py b/pixel/dump_geocr.py
+new file mode 100644
+index 0000000..1a32327
+--- /dev/null
++++ b/pixel/dump_geocr.py
+@@ -0,0 +1,191 @@
++#!/usr/bin/env python
++"""Write IDF-CR pixel-stage predictions as float32 CHW .npy files plus a manifest."""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import os
++import sys
++import time
++from pathlib import Path
++
++import numpy as np
++import torch
++import yaml
++
++HERE = Path(__file__).resolve().parent
++if str(HERE) not in sys.path:
++    sys.path.insert(0, str(HERE))
++
++import geocr_data as G
++import geocr_eval as E
++from attrdict import AttrMap
++from train_geocr import build_generator, pick_device, seed_all
++
++METHOD = "idfcr-pixel"
++
++
++def load_ckpt(gen, ckpt: Path) -> None:
++    state = torch.load(ckpt, map_location="cpu", weights_only=True)
++    if all(k.startswith("module.") for k in state):
++        state = {k[len("module."):]: v for k, v in state.items()}
++    gen.load_state_dict(state)
++
++
++def canonical(cfg: dict, out, batch_index: int) -> np.ndarray:
++    fam = cfg["family"]
++    if fam == "display8":
++        return out[batch_index].cpu().numpy()
++    if fam == "sen2mtc":
++        rgb = out[batch_index].cpu().numpy()
++        pad = np.zeros((1, *rgb.shape[-2:]), dtype=rgb.dtype)
++        return np.concatenate([rgb, pad], axis=0)
++    if fam == "whus2":
++        o10, o20, o60 = out
++        return G.fuse13_arrays(o10[batch_index].cpu().numpy(),
++                               o20[batch_index].cpu().numpy(),
++                               o60[batch_index].cpu().numpy())
++    raise SystemExit(f"unknown family {fam!r}")
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--config", required=True)
++    ap.add_argument("--ckpt", required=True)
++    ap.add_argument("--split", default="test")
++    ap.add_argument("--ids-file", default=None,
++                    help="predict a subset of the split (one id per line)")
++    ap.add_argument("--dumps-root", default=None)
++    ap.add_argument("--run-id", default=None)
++    ap.add_argument("--dtype", default=None, choices=["float32", "float16"],
++                    help="default: float16 for 13-band splits of >=5,000 items, else float32")
++    ap.add_argument("--batch", type=int, default=None)
++    ap.add_argument("--gpu", type=int, default=None,
++                    help="GPU index (required unless --cpu)")
++    ap.add_argument("--cpu", action="store_true")
++    ap.add_argument("--dry-run", action="store_true",
++                    help="size the output and validate the key set, write nothing")
++    args = ap.parse_args()
++
++    with open(args.config, encoding="utf-8") as f:
++        config = AttrMap(yaml.safe_load(f))
++    cfg = G.corpus_cfg(config.corpus, config)
++    ckpt = Path(args.ckpt)
++
++    device = pick_device(config, args)
++    seed_all(int(config.manualSeed))
++
++    src = config.get("source", "native")
++    ds = G.build_dataset(cfg, args.split, src, config.get("export_root"),
++                         with_target=False)
++    if args.ids_file:
++        ids = [s for s in (l.split("#", 1)[0].strip()
++                           for l in Path(args.ids_file).read_text().splitlines()) if s]
++        missing = set(ids) - set(ds.ids)
++        if missing:
++            raise SystemExit(f"--ids-file has {len(missing)} ids not in the "
++                             f"{args.split} split, first: {sorted(missing)[:3]}")
++        ds.ids = ids
++    keys = [G.sid_flat(s) for s in ds.ids]
++    stems = [Path(k).stem for k in keys]
++    if len(set(stems)) != len(stems):
++        raise SystemExit("sid_flat collision -- refusing to write a dump whose "
++                         "key set cannot equal the split list")
++
++    nb = len(cfg["bands"])
++    res = int(cfg["resolution"][0])
++    dtype = args.dtype or ("float16" if (nb == 13 and len(ds.ids) >= 5000)
++                           else "float32")
++    nbytes = len(ds.ids) * nb * res * res * (2 if dtype == "float16" else 4)
++
++    run_path = ckpt.parent / "run.json"
++    run = {}
++    if run_path.is_file():
++        import json
++        run = json.loads(run_path.read_text())
++    run.setdefault("ckpt_selection", str(config.get("ckpt_selection",
++                                                    "best_on_dev(raw)")))
++    run.setdefault("train_split", str(config.get("train_split", "train")))
++    if run["ckpt_selection"] == "final" and ckpt.name != "last.pth":
++        raise SystemExit(
++            f"{ckpt.name}: ckpt_selection: final expects the run's last.pth")
++    cfg_sha = hashlib.sha256(Path(args.config).read_bytes()).hexdigest()[:7]
++    run_id = args.run_id or (f"{time.strftime('%Y%m%d')}_{cfg_sha}_"
++                             f"seed{run.get('seed', config.manualSeed)}")
++    dumps_root = Path(args.dumps_root or config.dumps_root)
++    method = METHOD
++    out_dir = dumps_root / cfg["dumps_key"] / args.split / method / run_id
++
++    print(f"[dump] {cfg['corpus']}/{args.split} n={len(ds.ids)} "
++          f"{nb}x{res}x{res} {dtype} -> {out_dir}")
++    print(f"[dump] {nbytes/1e9:.3f} GB in {len(ds.ids)} files "
++          f"({'DRY RUN, nothing written' if args.dry_run else 'writing'})")
++    if args.dry_run:
++        return 0
++
++    gen = build_generator(cfg["family"], device)
++    load_ckpt(gen, ckpt)
++    gen.eval()
++
++    (out_dir / "preds").mkdir(parents=True, exist_ok=True)
++    batch = int(args.batch or config.get("validation_batchsize", 8))
++    np_dtype = np.float16 if dtype == "float16" else np.float32
++    t0 = time.time()
++    written = 0
++    with torch.no_grad():
++        for lo in range(0, len(ds), batch):
++            items = [ds[i] for i in range(lo, min(lo + batch, len(ds)))]
++            sids = [it[-1] for it in items]
++            if cfg["family"] == "whus2":
++                x10 = torch.from_numpy(np.stack([it[0] for it in items])).to(device)
++                x20 = torch.from_numpy(np.stack([it[1] for it in items])).to(device)
++                x60 = torch.from_numpy(np.stack([it[2] for it in items])).to(device)
++                out = gen(x10, x20, x60)
++            else:
++                x = torch.from_numpy(np.stack([it[0] for it in items])).to(device)
++                out = gen(x)[1]
++            for b, sid in enumerate(sids):
++                arr = canonical(cfg, out, b).astype(np_dtype, copy=False)
++                if arr.shape != (nb, res, res):
++                    raise SystemExit(f"{sid}: dumped {arr.shape}, corpus declares "
++                                     f"{(nb, res, res)}")
++                np.save(out_dir / "preds" / f"{Path(G.sid_flat(sid)).stem}.npy", arr)
++                written += 1
++            if lo % (batch * 20) == 0:
++                print(f"[dump] {written}/{len(ds)}  ({time.time()-t0:.0f}s)")
++
++    have = {p.stem for p in (out_dir / "preds").glob("*.npy")}
++    if have != set(stems):
++        raise SystemExit(f"key set != split list ({len(have)} vs {len(stems)}) -- "
++                         "the rescorer would refuse this dump; refusing to "
++                         "write the manifest for it")
++
++    split_list = (Path(args.ids_file) if args.ids_file
++                  else Path(cfg["root"]) / cfg["splits_dir"] / f"{args.split}.txt")
++    extra = {
++        "run_id": run_id,
++        "dtype": dtype,
++        "split_list": str(split_list),
++        "split_list_sha256": E.sha256_file(split_list),
++        "ckpt": str(ckpt.resolve()),
++        "dump_seconds": round(time.time() - t0, 1),
++        "stage": "pixel",
++        "row_label": "IDF-CR (pixel stage)",
++        "caption_caveat": "pixel stage only; the latent refinement stage is not run",
++    }
++    if cfg["family"] == "sen2mtc":
++        extra.update({
++            "bands_predicted": ["R", "G", "B"],
++            "band_pad": {"NIR": "zeros (not predicted by this 3-channel model)"},
++        })
++    man = E.build_manifest(cfg, args.split, run, method=method,
++                           method_variant=Path(args.config).name, ckpt=ckpt,
++                           repo=HERE.parent, source=src, n_items=len(ds.ids),
++                           extra=extra)
++    E.write_json(out_dir / "manifest.json", man)
++    print(f"[dump] wrote {written} preds + manifest.json to {out_dir}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/pixel/eval.py b/pixel/eval.py
+index 9ab16be..bed1e4b 100644
+--- a/pixel/eval.py
++++ b/pixel/eval.py
+@@ -1,6 +1,5 @@
+ import numpy as np
+-from skimage.measure import compare_ssim as SSIM
+-# from skimage.metrics import structural_similarity as SSIM
++from skimage.metrics import structural_similarity as SSIM
+ from torch.autograd import Variable
+ import torch
+ from utils import save_image
+diff --git a/pixel/eval_2.py b/pixel/eval_2.py
+index b8894f8..4bb36a8 100644
+--- a/pixel/eval_2.py
++++ b/pixel/eval_2.py
+@@ -1,6 +1,5 @@
+ import numpy as np
+-from skimage.measure import compare_ssim as SSIM
+-# from skimage.metrics import structural_similarity as SSIM
++from skimage.metrics import structural_similarity as SSIM
+ from torch.autograd import Variable
+ import torch
+ from utils import save_image
+diff --git a/pixel/eval_3.py b/pixel/eval_3.py
+index 2f689c3..060d6c4 100644
+--- a/pixel/eval_3.py
++++ b/pixel/eval_3.py
+@@ -1,6 +1,5 @@
+ import numpy as np
+-from skimage.measure import compare_ssim as SSIM
+-# from skimage.metrics import structural_similarity as SSIM
++from skimage.metrics import structural_similarity as SSIM
+ from torch.autograd import Variable
+ import torch
+ from utils import save_image
+diff --git a/pixel/geocr_data.py b/pixel/geocr_data.py
+new file mode 100644
+index 0000000..372862b
+--- /dev/null
++++ b/pixel/geocr_data.py
+@@ -0,0 +1,216 @@
++"""Split-list datasets for the IDF-CR pixel stage."""
++from __future__ import annotations
++
++import os
++import sys
++from pathlib import Path
++
++import numpy as np
++import torch
++from torch.utils import data
++
++GEOCR_ROOT = Path(os.environ.get("GEOCR_ROOT", Path(__file__).resolve().parents[2] / "GeoCR"))
++BASELINES = Path(os.environ.get("GEOCR_BASELINES", GEOCR_ROOT / "baselines" / "common"))
++for _p in (str(BASELINES), str(BASELINES / "exporters"), str(GEOCR_ROOT)):
++    if _p not in sys.path:
++        sys.path.insert(0, _p)
++
++import rescore as RS
++from geocr.data.benchmarks import (
++    WHUS2CRvProvider, _read_png, _read_tif, _resize_u8,
++)
++
++U8 = 1.0 / 255.0
++
++IDFCR: dict[str, dict] = {
++    "tcloud": dict(family="display8", splits_dir="splits", dumps_key="tcloud",
++                   native=256, dev_key="tcloud_psnr"),
++    "cuhk_cr1": dict(
++        family="display8", splits_dir="splits", dumps_key="cuhk_cr",
++        native=512, dev_key="cuhkrgb_psnr",
++        override=dict(lineage="cuhk_rgb", bands=["R", "G", "B"], nir=False)),
++    "cuhk_cr2": dict(family="display8", splits_dir="splits", dumps_key="cuhk_cr2",
++                     native=512, dev_key="cuhkrgb_psnr"),
++    "sen2mtc_new": dict(family="sen2mtc", splits_dir="splits",
++                        dumps_key="sen2mtc_new", native=256, dev_key="mtc_psnr",
++                        frame=0),
++    "whus2crv": dict(family="whus2", splits_dir="splits", dumps_key="whus2crv",
++                     native=384, dev_key="psnr_all"),
++}
++
++
++def corpus_cfg(name: str, config=None) -> dict:
++    if name not in IDFCR:
++        raise SystemExit(
++            f"IDF-CR has no configuration for {name!r}; available: {sorted(IDFCR)}")
++    cfg = dict(RS.CORPORA[RS.resolve_corpus(name)])
++    extra = dict(IDFCR[name])
++    cfg.update(extra.pop("override", {}))
++    cfg.update(extra)
++    cfg["corpus"] = name
++    if config is not None:
++        if config.get("root"):
++            cfg["root"] = Path(config["root"])
++        if config.get("splits_dir"):
++            cfg["splits_dir"] = str(config["splits_dir"])
++    return cfg
++
++
++def sid_flat(sid: str) -> str:
++    return sid.replace("/", "__")
++
++
++def read_split(cfg: dict, split: str, root: Path | None = None) -> list[str]:
++    return RS.read_split(Path(root or cfg["root"]), split, cfg["splits_dir"])
++
++
++def attention_target(t: np.ndarray, x: np.ndarray, unit: float) -> np.ndarray:
++    return np.clip((t - x).sum(axis=-1) / unit, 0.0, 1.0).astype(np.float32)
++
++
++def _chw(a: np.ndarray) -> np.ndarray:
++    return np.ascontiguousarray(a.transpose(2, 0, 1), dtype=np.float32)
++
++
++class Display8Dataset(data.Dataset):
++
++    def __init__(self, cfg: dict, split: str, source: str = "native",
++                 export_root: str | None = None, with_target: bool = True):
++        self.cfg, self.split, self.source = cfg, split, source
++        self.res = int(cfg["resolution"][0])
++        self.nb = len(cfg["bands"])
++        self.with_target = with_target
++        self.root = Path(cfg["root"])
++        self.ids = read_split(cfg, split)
++        self.export = None
++        if source == "export":
++            if not export_root:
++                raise SystemExit("source: export requires export_root")
++            self.export = Path(export_root) / cfg["corpus"] / split
++            if not (self.export / "cloudy").is_dir():
++                raise SystemExit(
++                    f"{self.export}/cloudy missing -- run exporters/export_display8.py "
++                    f"--corpus {cfg['corpus']} --split {split}, or set source: native")
++        elif source != "native":
++            raise SystemExit(f"unknown source {source!r} (native|export)")
++
++    def __len__(self) -> int:
++        return len(self.ids)
++
++    def _clear_id(self, sid: str) -> str:
++        for needle, repl in self.cfg["clear_sub"]:
++            if needle in sid and (self.root / sid.replace(needle, repl)).is_file():
++                return sid.replace(needle, repl)
++        raise SystemExit(f"{sid}: no clear pair under {self.root}")
++
++    def _pair_u8(self, sid: str):
++        if self.source == "export":
++            k = sid_flat(sid)
++            x = _read_png(self.export / "cloudy" / k)
++            t = _read_png(self.export / "clear" / k) if self.with_target else None
++        else:
++            x = _resize_u8(_read_png(self.root / sid), self.res)
++            t = (_resize_u8(_read_png(self.root / self._clear_id(sid)), self.res)
++                 if self.with_target else None)
++        return x[..., :3], (None if t is None else t[..., :3])
++
++    def __getitem__(self, i: int):
++        sid = self.ids[i]
++        x_u8, t_u8 = self._pair_u8(sid)
++        x = _chw(x_u8.astype(np.float32) / 255.0)
++        if not self.with_target:
++            return x, sid
++        M = attention_target(t_u8.astype(np.float32), x_u8.astype(np.float32), 1.0)
++        t = _chw(t_u8.astype(np.float32) / 255.0)
++        return x, t, M, sid
++
++
++class Sen2MTCFrameDataset(data.Dataset):
++
++    def __init__(self, cfg: dict, split: str, frame: int = 0,
++                 with_target: bool = True):
++        self.cfg, self.frame, self.with_target = cfg, int(frame), with_target
++        self.root = Path(cfg["root"])
++        self.ids = read_split(cfg, split)
++
++    def __len__(self) -> int:
++        return len(self.ids)
++
++    def _frame_path(self, sid: str) -> Path:
++        target = self.root / sid
++        return target.parent.parent / "cloud" / f"{target.stem}_{self.frame}.tif"
++
++    def __getitem__(self, i: int):
++        sid = self.ids[i]
++        p = self._frame_path(sid)
++        if not p.is_file():
++            raise FileNotFoundError(f"{p}: expected cloud frame {self.frame}")
++        x4 = _read_tif(p).astype(np.float32) / 10000.0
++        x = np.ascontiguousarray(x4[:3])
++        if not self.with_target:
++            return x, sid
++        t4 = _read_tif(self.root / sid).astype(np.float32) / 10000.0
++        t = np.ascontiguousarray(t4[:3])
++        M = attention_target(t.transpose(1, 2, 0), x.transpose(1, 2, 0), U8)
++        return x, t, M, sid
++
++
++def whus2_paths(root: Path, sid: str) -> dict[str, Path]:
++    out = {}
++    for role in ("clear", "cloud"):
++        for res in ("10m", "20m", "60m"):
++            rel = sid.replace("clearDNclips", f"{role}DNclips").replace("/10m/", f"/{res}/")
++            out[f"{role}{res[:-1]}"] = Path(root) / rel
++    return out
++
++
++def fuse13_arrays(a10: np.ndarray, a20: np.ndarray, a60: np.ndarray) -> np.ndarray:
++    W = WHUS2CRvProvider
++    src = {"10m": a10, "20m": a20, "60m": a60}
++    h, w = a10.shape[-2:]
++    out = np.zeros((13, h, w), dtype=a10.dtype)
++    for res, dst in W.BAND_POS.items():
++        arr = src[res]
++        if arr.shape[0] != len(dst):
++            raise ValueError(f"{res}: expected {len(dst)} bands, got {arr.shape[0]}")
++        f = W.UPSAMPLE[res]
++        if f > 1:
++            arr = np.repeat(np.repeat(arr, f, axis=-2), f, axis=-1)
++        if arr.shape[-2:] != (h, w):
++            raise ValueError(f"{res}: upsampled to {arr.shape[-2:]}, expected {(h, w)}")
++        out[list(dst)] = arr
++    return out
++
++
++class WHUS2Dataset(data.Dataset):
++
++    def __init__(self, cfg: dict, split: str, with_target: bool = True):
++        self.cfg, self.with_target = cfg, with_target
++        self.root = Path(cfg["root"])
++        self.ids = read_split(cfg, split)
++
++    def __len__(self) -> int:
++        return len(self.ids)
++
++    def __getitem__(self, i: int):
++        sid = self.ids[i]
++        p = whus2_paths(self.root, sid)
++        x = [_read_tif(p[f"cloud{r}"]).astype(np.float32) / 10000.0
++             for r in ("10", "20", "60")]
++        if not self.with_target:
++            return x[0], x[1], x[2], sid
++        t = [_read_tif(p[f"clear{r}"]).astype(np.float32) / 10000.0
++             for r in ("10", "20", "60")]
++        return x[0], x[1], x[2], t[0], t[1], t[2], sid
++
++
++def build_dataset(cfg: dict, split: str, source: str = "native",
++                  export_root: str | None = None, with_target: bool = True):
++    fam = cfg["family"]
++    if fam == "display8":
++        return Display8Dataset(cfg, split, source, export_root, with_target)
++    if fam == "sen2mtc":
++        return Sen2MTCFrameDataset(cfg, split, cfg.get("frame", 0), with_target)
++    if fam == "whus2":
++        return WHUS2Dataset(cfg, split, with_target)
++    raise SystemExit(f"unknown family {fam!r}")
+diff --git a/pixel/geocr_eval.py b/pixel/geocr_eval.py
+new file mode 100644
+index 0000000..b8523fe
+--- /dev/null
++++ b/pixel/geocr_eval.py
+@@ -0,0 +1,140 @@
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++import subprocess
++from pathlib import Path
++
++import numpy as np
++import torch
++
++import geocr_data as G
++from geocr_data import RS
++
++
++def dev_indices(n: int, cap: int) -> list[int]:
++    if cap <= 0 or cap >= n:
++        return list(range(n))
++    step = math.ceil(n / cap)
++    return list(range(0, n, step))[:cap]
++
++
++def metrics_mean(preds: list[torch.Tensor], gts: list[torch.Tensor],
++                 cfg: dict) -> dict[str, float]:
++    acc: dict[str, list[float]] = {}
++    for p, g in zip(preds, gts):
++        for k, v in RS.metrics_one(p, g, cfg, None).items():
++            acc.setdefault(k, []).append(float(v))
++    return {k: float(np.mean(v)) for k, v in acc.items()}
++
++
++def slope_last10(history: list[tuple[int, float]]) -> float | None:
++    if len(history) < 2:
++        return None
++    last_step, last_val = history[-1]
++    cut = 0.9 * last_step
++    ref = min(history, key=lambda h: abs(h[0] - cut))
++    return float(last_val - ref[1])
++
++
++def loss_slope_last10(losses: list[float]) -> float | None:
++    n = len(losses)
++    if n < 20:
++        return None
++    w = max(1, n // 10)
++    late = sum(losses[-w:]) / w
++    prev = sum(losses[-2 * w:-w]) / w
++    return float(late - prev)
++
++
++def sha256_file(p: Path) -> str:
++    h = hashlib.sha256()
++    with open(p, "rb") as fh:
++        for c in iter(lambda: fh.read(1 << 20), b""):
++            h.update(c)
++    return h.hexdigest()
++
++
++def code_rev(repo: Path) -> str:
++    try:
++        return subprocess.run(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
++                              capture_output=True, text=True, timeout=20).stdout.strip() or "unknown"
++    except Exception:
++        return "unknown"
++
++
++CODE_PATCHES = [
++    "WHUS2/allnet.py sorted() at both glob levels",
++    "WHUS2/gdaldiy.py gdal -> tifffile",
++    "train_woGAN.py, train_woGAN_whus2.py DataParallel device_ids",
++    "eval.py, eval_2.py, eval_3.py compare_ssim -> structural_similarity",
++    "models/gen/SPANet.py, SPANet_whus2.py cpu device fallback",
++    "predict_2.py save the prediction, not the attention map",
++    "new: attrdict.py geocr_data.py geocr_eval.py train_geocr.py dump_geocr.py",
++]
++
++
++def build_manifest(cfg: dict, split: str, run: dict, *, method: str,
++                   method_variant: str, ckpt: Path, repo: Path,
++                   source: str, n_items: int, extra: dict | None = None) -> dict:
++    root = Path(cfg["root"])
++    split_list = root / cfg["splits_dir"] / f"{split}.txt"
++    train_split = run.get("train_split", "train")
++    train_list = root / cfg["splits_dir"] / f"{train_split}.txt"
++    native = int(cfg["native"])
++    res = int(cfg["resolution"][0])
++
++    if cfg["family"] == "display8":
++        resample = ({"op": "none", "where": "n/a", "stage": "n/a"} if native == res else
++                    {"op": "PIL.BICUBIC",
++                     "where": "exporter" if source == "export" else "loader",
++                     "stage": "pre-inference",
++                     "fn": "geocr.data.benchmarks._resize_u8"})
++    else:
++        resample = {"op": "none", "where": "n/a", "stage": "n/a"}
++
++    man = {
++        "corpus": cfg["corpus"], "split": split,
++        "split_list_sha256": sha256_file(split_list), "n_items": n_items,
++        "resolution": [res, res], "crop": "none",
++        "bands": list(cfg["bands"]), "domain": cfg["domain"],
++        "processing_level": cfg["level"],
++        "split_list": str(split_list),
++        "native_resolution": [native, native],
++        "resample": resample,
++        "method": method, "method_variant": method_variant,
++        "code_rev": code_rev(repo), "code_patches": list(CODE_PATCHES),
++        "ckpt_sha256": sha256_file(ckpt) if ckpt and Path(ckpt).is_file() else None,
++        "ckpt_selection": run.get("ckpt_selection", "best_on_dev(raw)"),
++        "ema": run.get("ema", False),
++        "train_split": train_split,
++        "train_split_sha256": sha256_file(train_list) if train_list.is_file() else None,
++        "n_train": run.get("n_train"),
++        "seed": run.get("seed"),
++        "sampler": {"type": "deterministic_feedforward", "nfe": 1},
++        "frames_used": run.get("frames_used", 1),
++        "frame_rule": run.get("frame_rule", "n/a"),
++        "sar_used": False,
++        "sar_fill": "n/a",
++        "steps_used": run.get("steps_used"), "epochs_used": run.get("epochs_used"),
++        "ceiling_hit": run.get("ceiling_hit"),
++        "dev_evaluations_consumed": run.get("dev_evaluations_consumed"),
++        "dev_slope_last10": run.get("dev_slope_last10"),
++        "dev_metric": run.get("dev_metric"), "dev_best": run.get("dev_best"),
++        "dev_subset": run.get("dev_subset"),
++        "train_loss_slope_last10": run.get("train_loss_slope_last10"),
++        "batch_global": run.get("batch_global"), "microbatch": run.get("microbatch"),
++        "grad_accum": 1, "lr": run.get("lr"),
++        "wall_clock_h": run.get("wall_clock_h"), "gpu": run.get("gpu"),
++        "params_trainable": run.get("params_trainable"),
++        "params_total": run.get("params_total"),
++    }
++    if extra:
++        man.update(extra)
++    return man
++
++
++def write_json(p: Path, payload: dict) -> None:
++    p.parent.mkdir(parents=True, exist_ok=True)
++    p.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
+diff --git a/pixel/models/gen/SPANet.py b/pixel/models/gen/SPANet.py
+index 2c31ec3..b15f334 100644
+--- a/pixel/models/gen/SPANet.py
++++ b/pixel/models/gen/SPANet.py
+@@ -563,7 +563,8 @@ class SPANet_RSTB_woCA(nn.Module):
+ class Generator(nn.Module):
+     def __init__(self, gpu_ids):
+         super().__init__()
+-        self.device = torch.device("cuda:{}".format(gpu_ids[0]))
++        self.device = torch.device("cuda:{}".format(gpu_ids[0])
++                                   if torch.cuda.is_available() else "cpu")
+         #self.gen = nn.Sequential(OrderedDict([('gen', SPANet())]))
+         self.gen = nn.Sequential(OrderedDict([('gen', SPANet_RSTB())]))
+         # self.gen = nn.Sequential(OrderedDict([('gen', SPANet_RSTB_woCA())]))
+diff --git a/pixel/models/gen/SPANet_whus2.py b/pixel/models/gen/SPANet_whus2.py
+index a861ddf..af19ab2 100644
+--- a/pixel/models/gen/SPANet_whus2.py
++++ b/pixel/models/gen/SPANet_whus2.py
+@@ -481,7 +481,8 @@ class SPANet_RSTB2(nn.Module):
+ class Generator(nn.Module):
+     def __init__(self, gpu_ids):
+         super().__init__()
+-        self.device = torch.device("cuda:{}".format(gpu_ids[0]))
++        self.device = torch.device("cuda:{}".format(gpu_ids[0])
++                                   if torch.cuda.is_available() else "cpu")
+         # self.gen = nn.Sequential(OrderedDict([('gen', SPANet())]))
+         self.gen = SPANet_RSTB2()
+         self.gen.apply(weights_init)
+diff --git a/pixel/predict_2.py b/pixel/predict_2.py
+index 8b277ea..324ca2d 100644
+--- a/pixel/predict_2.py
++++ b/pixel/predict_2.py
+@@ -71,8 +71,7 @@ def predict(config, args):
+             # allim = allim.transpose(0, 3, 1, 4, 2) # 1 h 3 w c
+             # allim = allim.reshape((h*p, w*p, c)) # h 3w c
+             # save_image(args.out_dir, allim, i, 1, filename=filename)
+-            # save_image(args.out_dir, out_rgb.transpose(1, 2, 0) * 255, i, 1, filename=filename)
+-            save_image(args.out_dir, a.transpose(1, 2, 0), i, 1, filename=filename)
++            save_image(args.out_dir, out_rgb.transpose(1, 2, 0) * 255, i, 1, filename=filename)
+ 
+ 
+ if __name__ == '__main__':
+diff --git a/pixel/train_geocr.py b/pixel/train_geocr.py
+new file mode 100644
+index 0000000..8d997a3
+--- /dev/null
++++ b/pixel/train_geocr.py
+@@ -0,0 +1,274 @@
++#!/usr/bin/env python
++"""Train the IDF-CR pixel stage on a split list for a fixed number of optimizer steps."""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import random
++import sys
++import time
++from pathlib import Path
++
++import numpy as np
++import torch
++import yaml
++from torch import nn, optim
++from torch.utils.data import DataLoader
++
++HERE = Path(__file__).resolve().parent
++if str(HERE) not in sys.path:
++    sys.path.insert(0, str(HERE))
++
++import geocr_data as G
++import geocr_eval as E
++from attrdict import AttrMap
++
++
++def pick_device(config, args) -> torch.device:
++    if getattr(args, "cpu", False):
++        os.environ["CUDA_VISIBLE_DEVICES"] = ""
++        return torch.device("cpu")
++    ids = [args.gpu] if getattr(args, "gpu", None) is not None else list(config.gpu_ids)
++    if not config.cuda:
++        return torch.device("cpu")
++    if not ids:
++        raise SystemExit("no GPU selected: pass --gpu N, or --cpu")
++    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, ids))
++    if not torch.cuda.is_available():
++        raise SystemExit(f"CUDA_VISIBLE_DEVICES={ids} but torch sees no GPU")
++    config.gpu_ids = ids
++    return torch.device("cuda:0")
++
++
++def build_generator(family: str, device: torch.device):
++    if family == "whus2":
++        from models.gen.SPANet_whus2 import Generator
++    else:
++        from models.gen.SPANet import Generator
++    gen = Generator(gpu_ids=[0])
++    gen.device = device
++    return gen.to(device)
++
++
++def seed_all(seed: int) -> None:
++    random.seed(seed)
++    np.random.seed(seed)
++    torch.manual_seed(seed)
++    torch.cuda.manual_seed_all(seed)
++
++
++def loader(ds, batch, shuffle, threads, seed):
++    g = torch.Generator()
++    g.manual_seed(seed)
++    return DataLoader(ds, batch_size=batch, shuffle=shuffle, num_workers=threads,
++                      drop_last=shuffle, generator=g if shuffle else None,
++                      pin_memory=torch.cuda.is_available())
++
++
++@torch.no_grad()
++def evaluate(gen, ds, cfg, device, batch, threads, cap: int) -> dict[str, float]:
++    gen.eval()
++    idx = E.dev_indices(len(ds), cap)
++    sub = torch.utils.data.Subset(ds, idx)
++    dl = loader(sub, batch, False, threads, 0)
++    preds, gts = [], []
++    for batch_i in dl:
++        if cfg["family"] == "whus2":
++            x10, x20, x60, t10, t20, t60 = [b.to(device) for b in batch_i[:6]]
++            o10, o20, o60 = gen(x10, x20, x60)
++            for b in range(x10.shape[0]):
++                preds.append(torch.from_numpy(G.fuse13_arrays(
++                    o10[b].cpu().numpy(), o20[b].cpu().numpy(), o60[b].cpu().numpy())))
++                gts.append(torch.from_numpy(G.fuse13_arrays(
++                    t10[b].cpu().numpy(), t20[b].cpu().numpy(), t60[b].cpu().numpy())))
++        else:
++            x, t = batch_i[0].to(device), batch_i[1]
++            _, out = gen(x)
++            out = out.cpu()
++            for b in range(x.shape[0]):
++                preds.append(out[b])
++                gts.append(t[b])
++    gen.train()
++    return E.metrics_mean(preds, gts, cfg)
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--config", required=True)
++    ap.add_argument("--lr", type=float, default=None,
++                    help="override config.lr")
++    ap.add_argument("--seed", type=int, default=None, help="override config.manualSeed")
++    ap.add_argument("--out", default=None, help="override config.out_dir")
++    ap.add_argument("--gpu", type=int, default=None,
++                    help="GPU index (required unless --cpu)")
++    ap.add_argument("--cpu", action="store_true")
++    ap.add_argument("--max-steps", type=int, default=None,
++                    help="override config.max_steps (short test runs)")
++    args = ap.parse_args()
++
++    with open(args.config, encoding="utf-8") as f:
++        config = AttrMap(yaml.safe_load(f))
++    if args.lr is not None:
++        config.lr = args.lr
++    if args.seed is not None:
++        config.manualSeed = args.seed
++    if args.out is not None:
++        config.out_dir = args.out
++    if args.max_steps is not None:
++        config.max_steps = args.max_steps
++        config.short_run = True
++
++    sel = str(config.get("ckpt_selection", "best_on_dev(raw)"))
++    final_only = sel == "final"
++    train_split = str(config.get("train_split", "train"))
++    if final_only and train_split == "train":
++        raise SystemExit("ckpt_selection: final expects train_split: trainval")
++
++    cfg = G.corpus_cfg(config.corpus, config)
++    device = pick_device(config, args)
++    seed_all(int(config.manualSeed))
++    torch.backends.cudnn.benchmark = True
++
++    out_dir = Path(config.out_dir)
++    out_dir.mkdir(parents=True, exist_ok=True)
++    (out_dir / "config_used.yml").write_text(yaml.safe_dump(dict(config), sort_keys=False))
++
++    src = config.get("source", "native")
++    train_ds = G.build_dataset(cfg, train_split, src, config.get("export_root"))
++    if set(G.read_split(cfg, train_split)) & set(G.read_split(cfg, "test")):
++        raise SystemExit(f"{train_split} and test overlap -- refusing to train")
++    if final_only:
++        val_ds = None
++    else:
++        val_ds = G.build_dataset(cfg, "val", src, config.get("export_root"))
++        if set(G.read_split(cfg, "val")) & set(G.read_split(cfg, "test")):
++            raise SystemExit("val and test overlap -- refusing to train")
++    print(f"[train] corpus={cfg['corpus']} family={cfg['family']} "
++          f"split={train_split} n_train={len(train_ds)} "
++          f"n_val={'none' if final_only else len(val_ds)} "
++          f"ckpt_selection={sel} device={device}")
++
++    gen = build_generator(cfg["family"], device)
++    n_par = sum(p.numel() for p in gen.parameters())
++    opt = optim.Adam(gen.parameters(), lr=config.lr,
++                     betas=(config.beta1, 0.999), weight_decay=0.00001)
++    l1, mse = nn.L1Loss().to(device), nn.MSELoss().to(device)
++
++    max_steps = int(config.max_steps)
++    if final_only:
++        eval_every = int(config.get("ckpt_every", config.get("eval_every", max_steps)))
++        patience, dev_cap = None, 0
++    else:
++        eval_every = int(config.eval_every)
++        patience = int(config.patience_evals)
++        dev_cap = int(config.get("dev_subset", 0))
++    dev_key = cfg["dev_key"]
++
++    dl = loader(train_ds, int(config.batchsize), True, int(config.threads),
++                int(config.manualSeed))
++    step, best, best_step, since_best, n_nonfinite = 0, -float("inf"), 0, 0, 0
++    history: list[tuple[int, float]] = []
++    losses: list[float] = []
++    t0 = time.time()
++    stop = False
++
++    while not stop:
++        for batch in dl:
++            if cfg["family"] == "whus2":
++                x10, x20, x60, t10, t20, t60 = [b.to(device, non_blocking=True)
++                                                for b in batch[:6]]
++                o10, o20, o60 = gen(x10, x20, x60)
++                loss = (l1(o10, t10) + l1(o20, t20) + l1(o60, t60)) * config.lamb
++            else:
++                x, t, M = [b.to(device, non_blocking=True) for b in batch[:3]]
++                att, out = gen(x)
++                loss = l1(out, t) * config.lamb + mse(att[:, 0, :, :], M)
++
++            opt.zero_grad()
++            loss.backward()
++            opt.step()
++            step += 1
++            losses.append(float(loss.detach()))
++            if not torch.isfinite(loss):
++                n_nonfinite += 1
++                print(f"[train] WARNING non-finite loss at step {step} "
++                      f"(upstream has no guard; counted, not skipped)")
++
++            if step % 50 == 0:
++                print(f"[train] step {step}/{max_steps} loss {loss.item():.4f} "
++                      f"({(time.time()-t0)/step:.3f} s/step)")
++
++            if step % eval_every == 0 or step >= max_steps:
++                if final_only:
++                    torch.save(gen.state_dict(), out_dir / "last.pth")
++                else:
++                    m = evaluate(gen, val_ds, cfg, device, int(config.validation_batchsize),
++                                 int(config.threads), dev_cap)
++                    v = m[dev_key]
++                    history.append((step, v))
++                    improved = v > best
++                    print(f"[dev] step {step}  {dev_key}={v:.4f}"
++                          f"{'  *best*' if improved else ''}  "
++                          + "  ".join(f"{k}={x:.4f}" for k, x in m.items() if k != dev_key))
++                    if improved:
++                        best, best_step, since_best = v, step, 0
++                        torch.save(gen.state_dict(), out_dir / "best.pth")
++                    else:
++                        since_best += 1
++                    torch.save(gen.state_dict(), out_dir / "last.pth")
++                    if since_best >= patience:
++                        print(f"[train] early stop: {patience} evals without improvement")
++                        stop = True
++            if step >= max_steps or stop:
++                stop = True
++                break
++
++    wall = (time.time() - t0) / 3600.0
++    run = {
++        "corpus": cfg["corpus"], "config": str(Path(args.config).resolve()),
++        "short_run": bool(config.get("short_run", False)),
++        "seed": int(config.manualSeed), "lr": float(config.lr),
++        "batch_global": int(config.batchsize), "microbatch": int(config.batchsize),
++        "grad_accum": 1,
++        "train_split": train_split,
++        "n_train": len(train_ds), "n_val": None if final_only else len(val_ds),
++        "steps_used": step, "max_steps": max_steps,
++        "epochs_used": round(step * int(config.batchsize) / max(len(train_ds), 1), 2),
++        "ceiling_hit": step >= max_steps,
++        "dev_metric": None if final_only else dev_key,
++        "dev_best": None if final_only else best,
++        "dev_best_step": None if final_only else best_step,
++        "dev_evaluations_consumed": len(history),
++        "dev_slope_last10": E.slope_last10(history),
++        "dev_subset": None if final_only else (dev_cap or len(val_ds)),
++        "dev_history": history,
++        "train_loss_slope_last10": E.loss_slope_last10(losses),
++        "ema": False,
++        "ckpt_selection": sel,
++        "ckpt_dumped": "last.pth" if final_only else "best.pth",
++        "frames_used": 1,
++        "frame_rule": ("frame index 0"
++                       if cfg["family"] == "sen2mtc" else "n/a"),
++        "wall_clock_h": round(wall, 3),
++        "gpu": (torch.cuda.get_device_name(0) if device.type == "cuda" else "cpu"),
++        "params_trainable": n_par, "params_total": n_par,
++        "n_nonfinite_loss": n_nonfinite,
++        "source": src,
++    }
++    E.write_json(out_dir / "run.json", run)
++    if final_only:
++        print(f"[train] done: {step} steps, {wall*60:.1f} min; checkpoint {out_dir/'last.pth'}")
++        keys = ("steps_used", "epochs_used", "ceiling_hit",
++                "ckpt_selection", "train_loss_slope_last10")
++    else:
++        print(f"[train] done: {step} steps, {wall*60:.1f} min, "
++              f"best {dev_key}={best:.4f} @ step {best_step}")
++        keys = ("steps_used", "epochs_used", "ceiling_hit",
++                "dev_best", "dev_slope_last10")
++    print(json.dumps({k: run[k] for k in keys}, indent=2))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/pixel/train_woGAN.py b/pixel/train_woGAN.py
+index c43e37d..eff10e0 100644
+--- a/pixel/train_woGAN.py
++++ b/pixel/train_woGAN.py
+@@ -71,7 +71,7 @@ def train(config):
+     criterionMSE = nn.MSELoss()
+     criterionSoftplus = nn.Softplus()
+     if config.cuda:
+-        gen = nn.DataParallel(gen, device_ids=[0, 1, 2, 3])
++        gen = nn.DataParallel(gen, device_ids=list(range(torch.cuda.device_count())))
+         gen = gen.cuda()
+         # dis = dis.cuda()
+         criterionL1 = criterionL1.cuda()
+diff --git a/pixel/train_woGAN_whus2.py b/pixel/train_woGAN_whus2.py
+index 1633132..58be729 100644
+--- a/pixel/train_woGAN_whus2.py
++++ b/pixel/train_woGAN_whus2.py
+@@ -82,7 +82,7 @@ def train(config):
+     criterionMSE = nn.MSELoss()
+     criterionSoftplus = nn.Softplus()
+     if config.cuda:
+-        gen = nn.DataParallel(gen, device_ids=[0, 1,2,3])
++        gen = nn.DataParallel(gen, device_ids=list(range(torch.cuda.device_count())))
+         gen = gen.cuda()
+         criterionL1 = criterionL1.cuda()
+         criterionMSE = criterionMSE.cuda()

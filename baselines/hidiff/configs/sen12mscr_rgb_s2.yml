@@ -1,0 +1,124 @@
+# HI-Diff stage 2 on SEN12MS-CR (RGB): 25000 updates at batch 32 (4 chunks of 8) on the trainval split.
+# train.sh fills in the export root and runs stage 1, then stage 2.
+name: geocr_sen12mscr_rgb_s2_seed0
+model_type: HI_Diff_S2
+scale: 1
+num_gpu: 1
+manual_seed: 0
+datasets:
+  train:
+    name: TrainSet
+    type: PairedImageIRDataset
+    dataroot_gt: ${CR_EXPORTS}/sen12mscr_rgb/trainval/clear
+    dataroot_lq: ${CR_EXPORTS}/sen12mscr_rgb/trainval/cloudy
+    meta_info_file: ${CR_EXPORTS}/sen12mscr_rgb/trainval/list.txt
+    filename_tmpl: '{}'
+    io_backend:
+      type: disk
+    use_shuffle: true
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 32
+    dataset_enlarge_ratio: 7
+    prefetch_mode: ~
+    mini_batch_sizes: [32]
+    iters: [10000]
+    gt_size: 256
+    gt_sizes: [256]
+network_g:
+  type: Transformer
+  inp_channels: 3
+  out_channels: 3
+  dim: 48
+  num_blocks: [3,5,6,6]
+  num_refinement_blocks: 4
+  heads: [1,2,4,8]
+  ffn_expansion_factor: 2.66
+  bias: False
+  LayerNorm_type: WithBias
+  dual_pixel_task: False
+  embed_dim: 64
+  group: 4
+network_le:
+  type: latent_encoder_gelu
+  in_chans: 6
+  embed_dim: 64
+  block_num: 6
+  group: 4
+  stage: 1
+  patch_expansion: 0.5
+  channel_expansion: 4
+network_le_dm:
+  type: latent_encoder_gelu
+  in_chans: 3
+  embed_dim: 64
+  block_num: 6
+  group: 4
+  stage: 2
+  patch_expansion: 0.5
+  channel_expansion: 4
+network_d:
+  type: denoising
+  in_channel: 256
+  out_channel: 256
+  inner_channel: 512
+  block_num: 4
+  group: 4
+  patch_expansion: 0.5
+  channel_expansion: 2
+diffusion_schedule:
+  apply_ldm: False
+  schedule: linear
+  timesteps: 8
+  linear_start: 0.1
+  linear_end: 0.99
+path:
+  pretrain_network_g: experiments/geocr_sen12mscr_rgb_s1_seed0/models/net_g_latest.pth
+  param_key_g: params
+  strict_load_g: true
+  pretrain_network_le: experiments/geocr_sen12mscr_rgb_s1_seed0/models/net_le_latest.pth
+  param_key_le: params
+  strict_load_le: true
+  pretrain_network_le_dm: ~
+  param_key_le_dm: params
+  strict_load_le_dm: true
+  pretrain_network_d: ~
+  param_key_d: params
+  strict_load_d: true
+  resume_state: ~
+train:
+  micro_batch: 8
+  total_iter: 25000
+  warmup_iter: -1
+  use_grad_clip: True
+  scheduler:
+    type: CosineAnnealingRestartCyclicLR
+    periods: [8333, 16667]
+    restart_weights: [1,1]
+    eta_mins: [0.00023784142,0.0000011892071]
+  mixing_augs:
+    mixup: false
+    mixup_beta: 1.2
+    use_identity: true
+  optim_total:
+    type: AdamW
+    lr: 0.00023784142
+    weight_decay: 0.0001
+    betas: [0.9, 0.999]
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+  pixel_diff_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+logger:
+  print_freq: 250
+  save_checkpoint_freq: 12500
+  use_tb_logger: false
+  wandb:
+    project: ~
+    resume_id: ~
+dist_params:
+  backend: nccl
+  port: 29500

@@ -1,0 +1,848 @@
+diff --git a/data/dataLoader.py b/data/dataLoader.py
+index de5e6f1..45ea4df 100644
+--- a/data/dataLoader.py
++++ b/data/dataLoader.py
+@@ -10,7 +10,10 @@ to_date   = lambda string: datetime.strptime(string, '%Y-%m-%d')
+ S1_LAUNCH = to_date('2014-04-03')
+ 
+ # s2cloudless: see https://github.com/sentinel-hub/sentinel2-cloud-detector
+-from s2cloudless import S2PixelCloudDetector
++try:
++    from s2cloudless import S2PixelCloudDetector
++except ImportError:
++    S2PixelCloudDetector = None
+ 
+ import rasterio
+ from rasterio.merge import merge
+@@ -636,7 +639,7 @@ class SEN12MSCR(Dataset):
+                     # omit patches that are potentially unpaired
+                     if not all([os.path.isfile(paths_S1[pdx]), os.path.isfile(paths_S2[pdx]), os.path.isfile(paths_S2_cloudy[pdx])]): continue
+                     # don't add patch if not belonging to the selected split
+-                    if not any([split_roi in paths_S1[pdx] for split_roi in self.splits[self.split]]): continue
++                    if f'{seed}/{roi}' not in self.splits[self.split]: continue
+                     sample = {"S1":         paths_S1[pdx],
+                               "S2":         paths_S2[pdx],
+                               "S2_cloudy":  paths_S2_cloudy[pdx]}
+diff --git a/data/geocr_corpora.py b/data/geocr_corpora.py
+new file mode 100644
+index 0000000..20d5b1f
+--- /dev/null
++++ b/data/geocr_corpora.py
+@@ -0,0 +1,280 @@
++"""Split-list datasets for SEN12MS-CR, WHUS2-CRv, Sen2_MTC_New, T-CLOUD and CUHK-CR."""
++from __future__ import annotations
++
++import os
++import sys
++from pathlib import Path
++
++import numpy as np
++from torch.utils.data import Dataset
++
++_WORK = Path(__file__).resolve().parents[2]
++CR_DATASETS = Path(os.environ.get("CR_DATASETS", _WORK / "CR_datasets"))
++GEOCR_ROOT = Path(os.environ.get("GEOCR_ROOT", _WORK / "GeoCR"))
++GEOCR_BASELINES = Path(os.environ.get("GEOCR_BASELINES", GEOCR_ROOT / "baselines" / "common"))
++
++
++_G = {}
++
++
++def _geocr():
++    if _G:
++        return _G
++    if str(GEOCR_ROOT) not in sys.path:
++        sys.path.insert(0, str(GEOCR_ROOT))
++    if str(GEOCR_BASELINES) not in sys.path:
++        sys.path.insert(0, str(GEOCR_BASELINES))
++    try:
++        from geocr.data.benchmarks import _read_png, _read_tif, _resize_u8
++    except Exception as exc:
++        raise SystemExit(
++            f"cannot import geocr.data.benchmarks from {GEOCR_ROOT}: {exc}; set GEOCR_ROOT") from exc
++    _G.update(read_png=_read_png, read_tif=_read_tif, resize_u8=_resize_u8)
++    return _G
++
++
++def _fuse13():
++    _geocr()
++    try:
++        from exporters.export_whus2 import fuse13
++    except Exception as exc:
++        raise SystemExit(
++            f"cannot import exporters.export_whus2.fuse13 from {GEOCR_BASELINES}: {exc}; "
++            "set GEOCR_BASELINES") from exc
++    return fuse13
++
++
++def sid_flat(sid: str) -> str:
++    return sid.replace("/", "__")
++
++
++def read_split(root: Path, split: str, splits_dir: str = "splits") -> list[str]:
++    p = Path(root) / splits_dir / f"{split}.txt"
++    if not p.is_file():
++        raise SystemExit(f"missing split file {p}")
++    out = [s for s in (ln.split("#", 1)[0].strip()
++                       for ln in p.read_text().splitlines()) if s]
++    if not out:
++        raise SystemExit(f"{p} is empty")
++    return out
++
++
++CORPORA: dict[str, dict] = {
++    "sen12mscr": dict(
++        kind="sen12", root=CR_DATASETS / "SEN12MS-CR", bands=13, res=256, k=1,
++        level="l1c_toa", domain="reflectance", splits_dir="splits", sar=True,
++        band_names=["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8",
++                    "B8A", "B9", "B10", "B11", "B12"],
++    ),
++    "whus2crv": dict(
++        kind="whus2", root=CR_DATASETS / "WHUS2-CRv" / "extracted", bands=13,
++        res=384, k=1, level="boa", domain="reflectance", splits_dir="splits",
++        sar=False,
++        band_names=["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8",
++                    "B8A", "B9", "B10", "B11", "B12"],
++    ),
++    "sen2mtc_new": dict(
++        kind="mtc", root=CR_DATASETS / "Sen2_MTC_New", bands=4, res=256, k=3,
++        level="boa", domain="reflectance", splits_dir="splits", sar=False,
++        band_names=["R", "G", "B", "NIR"],
++    ),
++    "tcloud": dict(
++        kind="display8", root=CR_DATASETS / "T-CLOUD", bands=3, res=256, k=1,
++        native=256, level="display8", domain="unit_float", splits_dir="splits",
++        sar=False, nir=False, band_names=["R", "G", "B"],
++        clear_sub=[("/cloud/", "/reference/"), ("/cloud/", "/label/")],
++    ),
++    "cuhk_cr1": dict(
++        kind="display8", root=CR_DATASETS / "C-CUHK" / "CUHK-CR1", bands=4,
++        res=256, k=1, native=512, level="display8", domain="unit_float",
++        splits_dir="splits", sar=False, nir=True,
++        band_names=["R", "G", "B", "NIR"],
++        clear_sub=[("/cloud/", "/label/")],
++    ),
++    "cuhk_cr2": dict(
++        kind="display8", root=CR_DATASETS / "C-CUHK" / "CUHK-CR2", bands=3,
++        res=256, k=1, native=512, level="display8", domain="unit_float",
++        splits_dir="splits", sar=False, nir=False, band_names=["R", "G", "B"],
++        clear_sub=[("/cloud/", "/label/")],
++    ),
++}
++
++ALIASES = {"cuhk_cr": "cuhk_cr1"}
++
++
++def resolve(name: str) -> str:
++    name = ALIASES.get(name, name)
++    if name not in CORPORA:
++        raise SystemExit(f"unknown corpus {name!r}; have {sorted(CORPORA)} "
++                         f"(aliases {ALIASES})")
++    return name
++
++
++def _zeros_mask(h: int, w: int) -> np.ndarray:
++    return np.zeros((h, w), dtype=np.float32)
++
++
++class _Base(Dataset):
++    def __init__(self, corpus: str, split: str, root=None, splits_dir=None,
++                 split_list=None, export_root=None):
++        self.corpus = resolve(corpus)
++        self.cfg = CORPORA[self.corpus]
++        self.split = split
++        self.root = Path(root) if root else self.cfg["root"]
++        self.splits_dir = splits_dir or self.cfg["splits_dir"]
++        self.export_root = Path(export_root) if export_root else None
++        if split_list:
++            p = Path(split_list)
++            if not p.is_file():
++                raise SystemExit(f"--split_list {p} does not exist")
++            self.split_file = p
++            self.ids = [s for s in (ln.split("#", 1)[0].strip()
++                                    for ln in p.read_text().splitlines()) if s]
++        else:
++            self.split_file = Path(self.root) / self.splits_dir / f"{split}.txt"
++            self.ids = read_split(self.root, split, self.splits_dir)
++        self.export_split = self.split_file.stem
++        self.res = self.cfg["res"]
++
++    def __len__(self):
++        return len(self.ids)
++
++
++class Sen12MSCRSplit(_Base):
++
++    def __init__(self, *a, use_sar=True, **kw):
++        super().__init__(*a, **kw)
++        self.use_sar = use_sar
++
++    def __getitem__(self, i):
++        from data.dataLoader import process_MS, process_SAR, read_img, read_tif
++        sid = self.ids[i]
++        p_cloudy = self.root / sid
++        p_clear = self.root / sid.replace("s2_cloudy", "s2")
++        x = process_MS(read_img(read_tif(p_cloudy)), "default").astype(np.float32)
++        y = process_MS(read_img(read_tif(p_clear)), "default").astype(np.float32)
++        sample = {
++            "input": {"S2": x, "masks": _zeros_mask(*x.shape[-2:]),
++                      "coverage": np.float32(0.0), "S2 path": str(p_cloudy)},
++            "target": {"S2": y, "S2 path": str(p_clear)},
++            "sid": sid,
++        }
++        if self.use_sar:
++            p_s1 = self.root / sid.replace("s2_cloudy", "s1")
++            sample["input"]["S1"] = process_SAR(
++                read_img(read_tif(p_s1)), "default").astype(np.float32)
++        return sample
++
++
++class WHUS2Dataset(_Base):
++
++    def __getitem__(self, i):
++        from data.dataLoader import process_MS
++        fuse13 = _fuse13()
++        sid = self.ids[i]
++        x = process_MS(fuse13(self.root, sid, "cloud").astype(np.float32),
++                       "default").astype(np.float32)
++        y = process_MS(fuse13(self.root, sid, "clear").astype(np.float32),
++                       "default").astype(np.float32)
++        return {"input": {"S2": x, "masks": _zeros_mask(*x.shape[-2:]),
++                          "coverage": np.float32(0.0), "S2 path": sid},
++                "target": {"S2": y, "S2 path": sid},
++                "sid": sid}
++
++
++class Sen2MTCNewDataset(_Base):
++
++    def __getitem__(self, i):
++        from data.dataLoader import process_MS
++        g = _geocr()
++        sid = self.ids[i]
++        target = self.root / sid
++        cloud_dir = target.parent.parent / "cloud"
++        frames = [cloud_dir / f"{target.stem}_{t}.tif" for t in range(self.cfg["k"])]
++        missing = [p for p in frames if not p.is_file()]
++        if missing:
++            raise FileNotFoundError(
++                f"{missing[0]}: expected cloud frames {target.stem}_{{0,1,2}}.tif")
++        xs = [process_MS(g["read_tif"](p).astype(np.float32), "default").astype(np.float32)
++              for p in frames]
++        y = process_MS(g["read_tif"](target).astype(np.float32), "default").astype(np.float32)
++        h, w = y.shape[-2:]
++        return {"input": {"S2": xs,
++                          "masks": [_zeros_mask(h, w) for _ in xs],
++                          "S2 TD": [np.int64(t) for t in range(len(xs))],
++                          "coverage": [np.float32(0.0) for _ in xs]},
++                "target": {"S2": [y]},
++                "sid": sid}
++
++
++class Display8Dataset(_Base):
++
++    def _native(self, sid, role):
++        g = _geocr()
++        cfg = self.cfg
++        if role == "clear":
++            for needle, repl in cfg["clear_sub"]:
++                cand = sid.replace(needle, repl)
++                if (self.root / cand).is_file():
++                    sid = cand
++                    break
++            else:
++                raise FileNotFoundError(
++                    f"{sid}: no clear pair via {cfg['clear_sub']} under {self.root}")
++        rgb = g["resize_u8"](g["read_png"](self.root / sid), self.res)
++        chans = [rgb[..., c] for c in range(3)]
++        if cfg["nir"]:
++            nir_root = self.root.parent / "nir" / self.root.name
++            arr = g["read_png"](nir_root / sid)
++            arr = arr[..., 0] if arr.ndim == 3 else arr
++            chans.append(g["resize_u8"](arr, self.res))
++        return np.stack(chans, 0).astype(np.float32) / 255.0
++
++    def _export(self, sid, role):
++        g = _geocr()
++        d = self.export_root / self.corpus / self.export_split
++        key = Path(sid_flat(sid)).with_suffix(".png").name
++        rgb = g["read_png"](d / role / key)
++        chans = [rgb[..., c] for c in range(3)]
++        if self.cfg["nir"]:
++            arr = g["read_png"](d / f"{role}_nir" / key)
++            chans.append(arr[..., 0] if arr.ndim == 3 else arr)
++        return np.stack(chans, 0).astype(np.float32) / 255.0
++
++    def __getitem__(self, i):
++        sid = self.ids[i]
++        load = self._export if self.export_root else self._native
++        x, y = load(sid, "cloudy"), load(sid, "clear")
++        return {"input": {"S2": x, "masks": _zeros_mask(*x.shape[-2:]),
++                          "coverage": np.float32(0.0), "S2 path": sid},
++                "target": {"S2": y, "S2 path": sid},
++                "sid": sid}
++
++
++_KINDS = {"sen12": Sen12MSCRSplit, "whus2": WHUS2Dataset,
++          "mtc": Sen2MTCNewDataset, "display8": Display8Dataset}
++
++
++def build_dataset(config, split: str):
++    from src.geocr_bands import S2_BANDS
++    corpus = resolve(config.corpus)
++    cfg = CORPORA[corpus]
++    if S2_BANDS != cfg["bands"]:
++        raise SystemExit(
++            f"band-width mismatch: corpus {corpus!r} has {cfg['bands']} bands but "
++            f"UNCR_S2_BANDS={S2_BANDS}.\n"
++            f"  export UNCR_S2_BANDS={cfg['bands']} before launching (see model/src/geocr_bands.py)")
++    if cfg["sar"] and getattr(config, "use_sar", False) and cfg["kind"] != "sen12":
++        raise SystemExit(f"--use_sar is not available for corpus {corpus!r}")
++    if not cfg["sar"] and getattr(config, "use_sar", False):
++        raise SystemExit(
++            f"corpus {corpus!r} ships no SAR; drop --use_sar")
++    kw = dict(root=config.corpus_root or None,
++              splits_dir=config.splits_dir or None,
++              export_root=config.export_root or None)
++    if split == "train" and getattr(config, "split_list", ""):
++        kw["split_list"] = config.split_list
++    cls = _KINDS[cfg["kind"]]
++    if cls is Sen12MSCRSplit:
++        return cls(corpus, split, use_sar=bool(config.use_sar), **kw)
++    return cls(corpus, split, **kw)
+diff --git a/model/dump_geocr.py b/model/dump_geocr.py
+new file mode 100644
+index 0000000..d9b66ad
+--- /dev/null
++++ b/model/dump_geocr.py
+@@ -0,0 +1,226 @@
++"""Write UnCRtainTS test predictions as CHW .npy files plus a manifest."""
++import argparse
++import hashlib
++import json
++import os
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import numpy as np
++import torch
++
++dirname = os.path.dirname(os.path.abspath(__file__))
++sys.path.append(os.path.dirname(dirname))
++
++from parse_args import create_parser
++from src import utils
++from src.geocr_bands import S2_BANDS
++from src.model_utils import get_model, load_checkpoint
++
++CODE_PATCHES = [
++    "data/dataLoader.py: exact ROI split match; optional s2cloudless import",
++    "model/src/backbones/base_model.py: optional fvcore import",
++    "model/train_reconstruct.py: plot band indices, plot file ids, --corpus datasets, "
++    "--max_steps, --early_stop_patience, --save_every_epoch, --ckpt_selection",
++    "model/test_reconstruct.py: keep --batch_size from the command line",
++    "model/parse_args.py: new flags",
++    "S2_BANDS read from src/geocr_bands.py (UNCR_S2_BANDS)",
++]
++
++
++def sha256_file(p):
++    h = hashlib.sha256()
++    with open(p, "rb") as fh:
++        for chunk in iter(lambda: fh.read(1 << 20), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++
++def git_rev(repo):
++    try:
++        return subprocess.check_output(
++            ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
++            text=True, stderr=subprocess.DEVNULL).strip()
++    except Exception:
++        return "unknown"
++
++
++def build_config():
++    parser = create_parser(mode="test")
++    cli = parser.parse_args()
++    conf = (Path(cli.load_config) if cli.load_config else
++            Path(dirname) / cli.weight_folder / cli.experiment_name / "conf.json")
++    if conf.is_file():
++        no_overwrite = [
++            "pid", "device", "resume_at", "trained_checkp", "res_dir",
++            "weight_folder", "root1", "root2", "root3", "max_samples_count",
++            "batch_size", "display_step", "plot_every", "export_every",
++            "input_t", "region", "min_cov", "max_cov",
++            "corpus", "corpus_root", "splits_dir", "split_list", "export_root",
++            "dump_dir", "dump_split", "method_name", "run_id", "dump_fp16",
++            "num_workers",
++        ]
++        d = {k: v for k, v in json.loads(conf.read_text()).items()
++             if k not in no_overwrite}
++        for k, v in vars(cli).items():
++            if k in no_overwrite:
++                d[k] = v
++        ns = argparse.Namespace()
++        ns.__dict__.update(d)
++        cfg = parser.parse_args(namespace=ns)
++    else:
++        print(f"WARNING: no conf.json at {conf}; using CLI flags alone.")
++        cfg = cli
++    return utils.str2list(cfg, ["encoder_widths", "decoder_widths", "out_conv"]), conf
++
++
++def main():
++    config, conf_path = build_config()
++    if not config.corpus:
++        raise SystemExit("--corpus is required")
++    if not config.dump_dir:
++        raise SystemExit("--dump_dir is required")
++
++    from data.geocr_corpora import CORPORA, build_dataset, resolve, sid_flat
++    from train_reconstruct import prepare_data
++
++    corpus = resolve(config.corpus)
++    ccfg = CORPORA[corpus]
++    ds = build_dataset(config, config.dump_split)
++    if S2_BANDS != ccfg["bands"]:
++        raise SystemExit(f"UNCR_S2_BANDS={S2_BANDS} but {corpus} has {ccfg['bands']}")
++
++    device = torch.device(config.device)
++    model = get_model(config).to(device)
++    ckpt_n = f"_epoch_{config.resume_at}" if config.resume_at > 0 else ""
++    load_checkpoint(config, config.weight_folder, model, f"model{ckpt_n}")
++    ckpt = Path(dirname) / config.weight_folder / config.experiment_name / f"model{ckpt_n}.pth.tar"
++    model.eval()
++    model.netG.eval()
++
++    out_dir = (Path(config.dump_dir) / corpus / config.dump_split /
++               config.method_name / (config.run_id or "run"))
++    (out_dir / "preds").mkdir(parents=True, exist_ok=True)
++
++    loader = torch.utils.data.DataLoader(
++        ds, batch_size=config.batch_size, shuffle=False,
++        num_workers=config.num_workers)
++
++    dtype = np.float16 if config.dump_fp16 else np.float32
++    if config.dump_fp16 and len(ds) < 5000:
++        raise SystemExit(f"float16 dumps are only used for splits of >= 5,000 items ({len(ds)} here)")
++
++    written, t0 = [], time.time()
++    with torch.no_grad():
++        for batch in loader:
++            sids = batch["sid"]
++            if config.sample_type == "pretrain":
++                x, y, m = prepare_data(batch, device, config)
++                dates = None
++            else:
++                x, y, m, dates = prepare_data(batch, device, config)
++            model.set_input({"A": x, "B": y, "dates": dates, "masks": m})
++            model.forward()
++            model.get_loss_G()
++            model.rescale()
++            pred = model.fake_B[:, 0, :S2_BANDS].float().cpu().numpy()
++            for b, sid in enumerate(sids):
++                stem = Path(sid_flat(sid)).stem
++                np.save(out_dir / "preds" / f"{stem}.npy", pred[b].astype(dtype))
++                written.append(stem)
++
++    expect = [Path(sid_flat(s)).stem for s in ds.ids]
++    if sorted(written) != sorted(expect) or len(set(written)) != len(expect):
++        raise SystemExit(
++            f"dump key set != split list: wrote {len(set(written))} unique of "
++            f"{len(written)} for {len(expect)} ids. Refusing to write a manifest.")
++
++    split_file = Path(ds.split_file)
++    train_conf = json.loads(conf_path.read_text()) if conf_path.is_file() else {}
++    train_file = Path(ds.root) / ds.splits_dir / "train.txt"
++    if train_conf.get("split_list"):
++        train_file = Path(train_conf["split_list"])
++    elif config.split_list:
++        train_file = Path(config.split_list)
++    trainlog = (Path(dirname) / config.weight_folder / config.experiment_name /
++                "trainlog.json")
++    epochs_used = None
++    if trainlog.is_file():
++        try:
++            epochs_used = max(int(k) for k in json.loads(trainlog.read_text()))
++        except Exception:
++            pass
++    n_train = sum(1 for ln in train_file.read_text().splitlines()
++                  if ln.split("#", 1)[0].strip()) if train_file.is_file() else None
++    native = ccfg.get("native", ccfg["res"])
++
++    if ccfg["kind"] == "display8":
++        resample = {"op": "PIL.BICUBIC",
++                    "via": "geocr.data.benchmarks._resize_u8",
++                    "where": "exporter" if config.export_root else "loader",
++                    "stage": "pre-inference"} if native != ccfg["res"] else \
++                   {"op": "none", "where": "n/a", "stage": "n/a"}
++    elif ccfg["kind"] == "whus2":
++        resample = {"op": "nearest-replication onto the 10 m grid",
++                    "via": "exporters/export_whus2.py::fuse13",
++                    "where": "loader", "stage": "pre-inference"}
++    else:
++        resample = {"op": "none", "where": "n/a", "stage": "n/a"}
++
++    man = {
++        "corpus": corpus, "split": config.dump_split,
++        "split_list": str(split_file), "split_list_sha256": sha256_file(split_file),
++        "n_items": len(expect),
++        "resolution": [ccfg["res"], ccfg["res"]],
++        "crop": "none",
++        "bands": list(ccfg["band_names"]),
++        "domain": ccfg["domain"],
++        "processing_level": ccfg["level"],
++        "native_resolution": [native, native],
++        "resample": resample,
++        "dtype": "float16" if config.dump_fp16 else "float32",
++        "method": config.method_name,
++        "method_variant": f"loss={config.loss}; covmode={config.covmode}; "
++                          f"use_sar={bool(config.use_sar)}; scale_by={config.scale_by}; "
++                          f"s2_bands={S2_BANDS}",
++        "code_rev": git_rev(Path(dirname).parent),
++        "code_patches": CODE_PATCHES,
++        "surgery": ("band count UNCR_S2_BANDS=%d" % S2_BANDS) if S2_BANDS != 13 else "none",
++        "ckpt": str(ckpt), "ckpt_sha256": sha256_file(ckpt) if ckpt.is_file() else None,
++        "ckpt_selection": ("final"
++                           if train_conf.get("ckpt_selection",
++                                             getattr(config, "ckpt_selection", "best_on_dev"))
++                           == "final" else "best_on_dev(val_loss)"),
++        "ema": False,
++        "train_split": str(train_file),
++        "train_split_sha256": sha256_file(train_file) if train_file.is_file() else None,
++        "n_train": n_train,
++        "seed": config.rdm_seed,
++        "sampler": {"type": "deterministic_feedforward", "nfe": 1},
++        "frames_used": ccfg["k"],
++        "frame_rule": ("all 3 frames in native order; no positional encoding"
++                       if ccfg["k"] > 1 else "n/a"),
++        "sar_used": bool(config.use_sar),
++        "sar_fill": "n/a",
++        "cloud_masks": "zeros (not used)",
++        "batch_global": config.batch_size, "microbatch": config.batch_size,
++        "grad_accum": 1, "lr": config.lr,
++        "max_steps": config.max_steps, "epochs_arg": config.epochs,
++        "epochs_used": epochs_used,
++        "params_trainable": int(sum(p.numel() for p in model.parameters()
++                                    if p.requires_grad)),
++        "params_total": int(sum(p.numel() for p in model.parameters())),
++        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
++        "dump_wall_clock_h": round((time.time() - t0) / 3600, 4),
++        "conf_json": str(conf_path),
++    }
++    if getattr(config, "meta_json", "") and Path(config.meta_json).is_file():
++        man.update(json.loads(Path(config.meta_json).read_text()))
++    (out_dir / "manifest.json").write_text(json.dumps(man, indent=2) + "\n")
++    print(f"wrote {len(expect)} preds + manifest.json to {out_dir}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/model/parse_args.py b/model/parse_args.py
+index 6cb4c2b..de3b836 100644
+--- a/model/parse_args.py
++++ b/model/parse_args.py
+@@ -1,6 +1,6 @@
+ import argparse
+ 
+-S2_BANDS = 13
++from src.geocr_bands import S2_BANDS
+ 
+ def create_parser(mode='train'):
+     parser = argparse.ArgumentParser()
+@@ -62,6 +62,8 @@ def create_parser(mode='train'):
+     parser.add_argument("--gamma", default=1.0, type=float, help="Learning rate decay parameter for scheduler")
+     parser.add_argument("--val_every", default=1, type=int, help="Interval in epochs between two validation steps.")
+     parser.add_argument("--val_after", default=0, type=int, help="Do validation only after that many epochs.")
++    parser.add_argument("--save_every_epoch", default=1, type=int,
++                        help="write model_epoch_<N>.pth.tar every N epochs; 0 disables it")
+ 
+     # flags specific to SEN12MS-CR and SEN12MS-CR-TS
+     parser.add_argument("--use_sar", dest="use_sar", action="store_true", help="whether to use SAR or not")
+@@ -92,4 +94,35 @@ def create_parser(mode='train'):
+     parser.add_argument("--use_custom", dest="use_custom", action="store_true", help="whether to test on individually specified patches or not")
+     parser.add_argument("--load_config", default='', type=str, help="path of conf.json file to load")
+ 
+-    return parser
+\ No newline at end of file
++    parser.add_argument("--corpus", default="", type=str,
++                        help="split-list corpus: '' (upstream SEN12MS-CR/-TS loaders) or one of "
++                             "sen12mscr|whus2crv|sen2mtc_new|tcloud|cuhk_cr1|cuhk_cr2")
++    parser.add_argument("--corpus_root", default="", type=str,
++                        help="corpus root; '' uses data/geocr_corpora.py's registry default")
++    parser.add_argument("--splits_dir", default="splits", type=str,
++                        help="subdirectory of --corpus_root holding the split lists")
++    parser.add_argument("--split_list", default="", type=str,
++                        help="optional path overriding the training list (e.g. trainval.txt)")
++    parser.add_argument("--export_root", default="", type=str,
++                        help="PNG export root for the 8-bit corpora (exporters/export_display8.py)")
++    parser.add_argument("--max_steps", default=-1, type=int,
++                        help="optimizer-step ceiling; -1 disables (upstream behaviour)")
++    parser.add_argument("--early_stop_patience", default=-1, type=int,
++                        help="stop after this many validation events without a new best "
++                             "validation loss; -1 disables (upstream behaviour)")
++    parser.add_argument("--ckpt_selection", default="best_on_dev",
++                        choices=["best_on_dev", "final"], type=str,
++                        help="checkpoint saved as model.pth.tar: 'best_on_dev' (upstream, best "
++                             "validation loss) or 'final' (the last epoch)")
++    parser.add_argument("--dump_dir", default="", type=str, help="dump root, e.g. .../dumps")
++    parser.add_argument("--dump_split", default="test", type=str, help="split to dump")
++    parser.add_argument("--method_name", default="uncrtaints", type=str,
++                        help="<method> component of the dump path, variant included")
++    parser.add_argument("--run_id", default="", type=str,
++                        help="run_id component of the dump path: YYYYMMDD_<sha>_seed<N>")
++    parser.add_argument("--dump_fp16", dest="dump_fp16", action="store_true",
++                        help="write float16 preds (permitted only when the split has >=5,000 items)")
++    parser.add_argument("--meta_json", default="", type=str,
++                        help="JSON of training facts merged into the manifest")
++
++    return parser
+diff --git a/model/src/backbones/base_model.py b/model/src/backbones/base_model.py
+index 6540efb..8d43f8e 100644
+--- a/model/src/backbones/base_model.py
++++ b/model/src/backbones/base_model.py
+@@ -2,10 +2,13 @@ import torch
+ import torch.nn as nn
+ 
+ from src import losses, model_utils
+-from fvcore.nn import FlopCountAnalysis
+-from fvcore.nn import flop_count_table
++try:
++    from fvcore.nn import FlopCountAnalysis
++    from fvcore.nn import flop_count_table
++except ImportError:
++    FlopCountAnalysis = flop_count_table = None
+ 
+-S2_BANDS = 13
++from src.geocr_bands import S2_BANDS
+ 
+ class BaseModel(nn.Module):
+     def __init__(
+diff --git a/model/src/backbones/uncrtaints.py b/model/src/backbones/uncrtaints.py
+index a91efbc..bb16752 100644
+--- a/model/src/backbones/uncrtaints.py
++++ b/model/src/backbones/uncrtaints.py
+@@ -10,7 +10,7 @@ import torch.nn as nn
+ from src.backbones.utae import ConvLayer, ConvBlock, TemporallySharedBlock
+ from src.backbones.ltae import LTAE2d, LTAE2dtiny
+ 
+-S2_BANDS = 13
++from src.geocr_bands import S2_BANDS
+ 
+ 
+ def get_norm_layer(out_channels, num_feats, n_groups=4, layer_type='batch'):
+diff --git a/model/src/geocr_bands.py b/model/src/geocr_bands.py
+new file mode 100644
+index 0000000..11130d9
+--- /dev/null
++++ b/model/src/geocr_bands.py
+@@ -0,0 +1,7 @@
++"""Output band count used where upstream hardcodes 13 (env UNCR_S2_BANDS, default 13)."""
++import os
++
++S2_BANDS = int(os.environ.get("UNCR_S2_BANDS", "13"))
++
++if S2_BANDS < 1:
++    raise ValueError(f"UNCR_S2_BANDS must be >= 1, got {S2_BANDS}")
+diff --git a/model/src/losses.py b/model/src/losses.py
+index 29e0f98..4f19a96 100644
+--- a/model/src/losses.py
++++ b/model/src/losses.py
+@@ -8,7 +8,7 @@ from torch.overrides import has_torch_function_variadic, handle_torch_function
+ 
+ from torch import vmap
+ 
+-S2_BANDS = 13
++from src.geocr_bands import S2_BANDS
+ 
+ 
+ def get_loss(config):
+diff --git a/model/src/model_utils.py b/model/src/model_utils.py
+index 6ac5733..c2a4e0c 100644
+--- a/model/src/model_utils.py
++++ b/model/src/model_utils.py
+@@ -6,7 +6,7 @@ if os.path.isdir(sub_dir): os.chdir(sub_dir)
+ from src.backbones import base_model, utae, uncrtaints
+ 
+ S1_BANDS = 2
+-S2_BANDS = 13
++from src.geocr_bands import S2_BANDS
+ 
+ def get_base_model(config):
+     model = base_model.BaseModel(config)
+diff --git a/model/test_reconstruct.py b/model/test_reconstruct.py
+index 7dd99e5..d324bb9 100644
+--- a/model/test_reconstruct.py
++++ b/model/test_reconstruct.py
+@@ -54,7 +54,7 @@ if os.path.isfile(conf_path):
+ else: config = test_config # otherwise, keep passed flags without any overwriting
+ config = utils.str2list(config, ["encoder_widths", "decoder_widths", "out_conv"])
+ 
+-if config.pretrain: config.batch_size = 32
++if config.pretrain and '--batch_size' not in sys.argv: config.batch_size = 32
+ 
+ experime_dir = os.path.join(config.res_dir, config.experiment_name)
+ if not os.path.exists(experime_dir): os.makedirs(experime_dir)
+diff --git a/model/train_reconstruct.py b/model/train_reconstruct.py
+index abc7e97..6211fcd 100644
+--- a/model/train_reconstruct.py
++++ b/model/train_reconstruct.py
+@@ -32,7 +32,7 @@ from torch.utils.tensorboard import SummaryWriter
+ from src import utils, losses
+ from src.learning.weight_init import weight_init
+ 
+-S2_BANDS = 13
++from src.geocr_bands import S2_BANDS
+ parser   = create_parser(mode='train')
+ config   = utils.str2list(parser.parse_args(), list_args=["encoder_widths", "decoder_widths", "out_conv"])
+ 
+@@ -113,6 +113,13 @@ if __name__ == "__main__": pprint.pprint(config)
+ # instantiate tensorboard logger
+ writer = SummaryWriter(os.path.join(os.path.dirname(config.res_dir), "logs", config.experiment_name))
+ 
++def _rgb_idx(n_ch):
++    """R,G,B channel indices for plots: 13 bands -> B4,B3,B2; 15 (S1+S2) -> offset by 2; else 0,1,2."""
++    if n_ch == 15: return [5, 4, 3]
++    if n_ch == 13: return [3, 2, 1]
++    return [0, 1, 2]
++
++
+ def plot_img(imgs, mod, plot_dir, file_id=None):
+     if not os.path.exists(plot_dir): os.makedirs(plot_dir)
+     try:
+@@ -120,7 +127,7 @@ def plot_img(imgs, mod, plot_dir, file_id=None):
+         for tdx, img in enumerate(imgs): # iterate over temporal dimension
+             time = '' if imgs.shape[0] == 1 else f'_t-{tdx}'
+             if mod in ["pred", "in", "target", "s2"]:
+-                rgb = [3,2,1] if img.shape[0]==S2_BANDS else [5,4,3]
++                rgb = _rgb_idx(img.shape[0])
+                 img, val_min, val_max = img[rgb, ...], 0, 1
+             elif mod == "s1":
+                 img, val_min, val_max = img[[0], ...], 0, 1
+@@ -231,11 +238,11 @@ def log_train(writer, config, model, step, x, out, y, in_m, name='', var=None):
+     # use add_images for batch-wise adding across temporal dimension
+     if config.use_sar:
+         writer.add_image(f'Img/train/{name}in_s1', x[0,:,[0], ...], step, dataformats='NCHW')
+-        writer.add_image(f'Img/train/{name}in_s2', x[0,:,[5,4,3], ...], step, dataformats='NCHW')
++        writer.add_image(f'Img/train/{name}in_s2', x[0,:,_rgb_idx(x.shape[2]), ...], step, dataformats='NCHW')
+     else:
+-        writer.add_image(f'Img/train/{name}in_s2', x[0,:,[3,2,1], ...], step, dataformats='NCHW')
+-    writer.add_image(f'Img/train/{name}out', out[0,0,[3,2,1], ...], step, dataformats='CHW')
+-    writer.add_image(f'Img/train/{name}y', y[0,0,[3,2,1], ...], step, dataformats='CHW')
++        writer.add_image(f'Img/train/{name}in_s2', x[0,:,_rgb_idx(x.shape[2]), ...], step, dataformats='NCHW')
++    writer.add_image(f'Img/train/{name}out', out[0,0,_rgb_idx(out.shape[2]), ...], step, dataformats='CHW')
++    writer.add_image(f'Img/train/{name}y', y[0,0,_rgb_idx(y.shape[2]), ...], step, dataformats='CHW')
+     writer.add_image(f'Img/train/{name}m', in_m[0,:,None, ...], step, dataformats='NCHW')
+ 
+     # analyse cloud coverage
+@@ -335,7 +342,7 @@ def iterate(model, data_loader, config, writer, mode="train", epoch=None, device
+                         extended_metrics = img_metrics(y[bdx], out[bdx])
+                     
+                     img_meter.add(extended_metrics)
+-                    idx = (i*batch_size+bdx) # plot and export every k-th item
++                    idx = (i*data_loader.batch_size+bdx)
+                     if config.plot_every>0 and idx % config.plot_every == 0:
+                         plot_dir = os.path.join(config.res_dir, config.experiment_name, 'plots', f'epoch_{epoch}', f'{mode}')
+                         plot_img(x[bdx], 'in', plot_dir, file_id=idx)
+@@ -369,7 +376,7 @@ def iterate(model, data_loader, config, writer, mode="train", epoch=None, device
+                 plot_out = out.detach().clone()
+                 batch_size = y.size()[0]
+                 for bdx in range(batch_size):
+-                    idx = (i*batch_size+bdx) # plot and export every k-th item
++                    idx = (i*data_loader.batch_size+bdx)
+                     if idx % config.plot_every == 0:
+                         plot_dir = os.path.join(config.res_dir, config.experiment_name, 'plots', f'epoch_{epoch}', f'{mode}')
+                         plot_img(x[bdx], 'in', plot_dir, file_id=i)
+@@ -392,6 +399,10 @@ def iterate(model, data_loader, config, writer, mode="train", epoch=None, device
+         # after each batch, close any leftover figures
+         plt.close('all')
+ 
++        if mode == "train" and config.max_steps > 0 and step + 1 >= config.max_steps:
++            print(f"Reached step ceiling --max_steps {config.max_steps}; ending epoch early.")
++            break
++
+     # --- end of epoch ---
+     # after each epoch, log the loss metrics
+     t_end = time.time()
+@@ -418,11 +429,11 @@ def iterate(model, data_loader, config, writer, mode="train", epoch=None, device
+         # use add_images for batch-wise adding across temporal dimension
+         if config.use_sar:
+             writer.add_image(f'Img/{mode}/in_s1', x[0,:,[0], ...], step, dataformats='NCHW')
+-            writer.add_image(f'Img/{mode}/in_s2', x[0,:,[5,4,3], ...], step, dataformats='NCHW')
++            writer.add_image(f'Img/{mode}/in_s2', x[0,:,_rgb_idx(x.shape[2]), ...], step, dataformats='NCHW')
+         else:
+-            writer.add_image(f'Img/{mode}/in_s2', x[0,:,[3,2,1], ...], step, dataformats='NCHW')
+-        writer.add_image(f'Img/{mode}/out', out[0,0,[3,2,1], ...], step, dataformats='CHW')
+-        writer.add_image(f'Img/{mode}/y', y[0,0,[3,2,1], ...], step, dataformats='CHW')
++            writer.add_image(f'Img/{mode}/in_s2', x[0,:,_rgb_idx(x.shape[2]), ...], step, dataformats='NCHW')
++        writer.add_image(f'Img/{mode}/out', out[0,0,_rgb_idx(out.shape[2]), ...], step, dataformats='CHW')
++        writer.add_image(f'Img/{mode}/y', y[0,0,_rgb_idx(y.shape[2]), ...], step, dataformats='CHW')
+         writer.add_image(f'Img/{mode}/m', in_m[0,:,None, ...], step, dataformats='NCHW')
+ 
+ 
+@@ -571,7 +582,12 @@ def main(config):
+     device = torch.device(config.device)
+ 
+     # define data sets
+-    if config.pretrain: # pretrain / training on mono-temporal data
++    if config.corpus:
++        from data.geocr_corpora import build_dataset
++        dt_train    = build_dataset(config, 'train')
++        dt_val      = build_dataset(config, 'val')
++        dt_test     = build_dataset(config, 'test')
++    elif config.pretrain:
+         dt_train    = SEN12MSCR(os.path.expanduser(config.root3), split='train', region=config.region, sample_type=config.sample_type)
+         dt_val      = SEN12MSCR(os.path.expanduser(config.root3), split='val', region=config.region, sample_type=config.sample_type) 
+         dt_test     = SEN12MSCR(os.path.expanduser(config.root3), split='test', region=config.region, sample_type=config.sample_type)
+@@ -641,6 +657,7 @@ def main(config):
+ 
+     # track best loss, checkpoint at best validation performance
+     is_better, best_loss = lambda new, prev: new <= prev, float("inf")
++    no_improve, stop_now = 0, False
+ 
+     # Training loop
+     trainlog = {}
+@@ -717,18 +734,37 @@ def main(config):
+             checkpoint(trainlog, config)
+             if is_better(val_loss, best_loss):
+                 best_loss = val_loss
+-                save_model(config, epoch, model, "model")
++                if config.ckpt_selection == "best_on_dev":
++                    save_model(config, epoch, model, "model")
++                no_improve = 0
++            else:
++                no_improve += 1
++                if config.early_stop_patience > 0 and no_improve >= config.early_stop_patience:
++                    print(f"Early stopping: {no_improve} validation events without "
++                          f"improvement (--early_stop_patience {config.early_stop_patience}).")
++                    stop_now = True
+         else:
+             trainlog[epoch] = {**train_metrics}
+             checkpoint(trainlog, config)
+ 
+         # always checkpoint the current epoch's model
+-        save_model(config, epoch, model, f"model_epoch_{epoch}")
++        if config.save_every_epoch > 0 and epoch % config.save_every_epoch == 0:
++            save_model(config, epoch, model, f"model_epoch_{epoch}")
++
++        if config.ckpt_selection == "final":
++            save_model(config, epoch, model, "model")
+ 
+         print(f'Completed current epoch of experiment {config.experiment_name}.')
+ 
++        if stop_now:
++            break
++        if config.max_steps > 0 and epoch * len(train_loader) >= config.max_steps:
++            print(f"Reached step ceiling --max_steps {config.max_steps} "
++                  f"({epoch} epochs x {len(train_loader)} steps); stopping.")
++            break
++
+     # following training, test on hold-out data
+-    print("Testing best epoch . . .")
++    print(f"Testing {'final' if config.ckpt_selection == 'final' else 'best'} epoch . . .")
+     load_checkpoint(config, config.res_dir, model, "model")
+     
+     model.eval()

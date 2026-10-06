@@ -1,0 +1,19 @@
+# torch==2.11.0 and torchvision==0.26.0 are installed first (see README).
+numpy==2.4.3
+pillow==12.3.0
+tifffile==2026.7.31
+scikit-image==0.26.0
+pandas==3.0.2
+pyarrow==25.0.0
+omegaconf==2.3.0
+einops==0.8.2
+safetensors==0.7.0
+huggingface-hub==1.26.0
+# evaluation
+scipy==1.17.1
+torchmetrics==1.9.0
+torch-fidelity==0.4.0
+pyiqa==0.1.16
+lpips==0.1.4
+# optional: AllClear preparation (geocr.data.transcode falls back to tifffile without it)
+rasterio==1.4.3

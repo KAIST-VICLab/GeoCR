@@ -1,0 +1,35 @@
+corpus: cuhk_cr2
+root: null
+splits_dir: splits
+
+train_split: trainval
+ckpt_selection: final
+source: auto
+export_root: null
+dump_root: ${OUT}/dumps
+
+steps: 10000
+batch_size: 32
+grad_accum: 1
+stage_split: 0.5
+eval_divisor: 40
+patience_evals: null
+stop_after_stage1: false
+max_hours: 24
+
+lr_grid:
+  - [6.69e-4, 4.77e-4]
+lr_point: 0
+lr_min: 5.0e-7
+
+seeds: [0, 1, 2]
+seed: 0
+
+patch_size_train: 256
+loss_weight1: 0.04
+autocast: true
+num_works: 4
+dev_batch_size: 8
+frame_index: 0
+device: null
+

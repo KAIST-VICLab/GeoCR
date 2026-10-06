@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+weights/
+runs/
+outputs/
+out/
+CR_datasets/
+CR_exports/

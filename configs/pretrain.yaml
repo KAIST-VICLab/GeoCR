@@ -1,0 +1,61 @@
+# CR_DATASETS=<data> torchrun --nproc_per_node=4 -m geocr.train configs/pretrain.yaml
+name: pretrain_multi
+data:
+  source: cr_corpus
+  corpus_roots:
+    allclear: ${oc.env:CR_DATASETS,CR_datasets}/AllClear
+    sen12mscr: ${oc.env:CR_DATASETS,CR_datasets}/SEN12MS-CR
+    whus2crv: ${oc.env:CR_DATASETS,CR_datasets}/WHUS2-CRv/extracted
+    sen2mtc_new: ${oc.env:CR_DATASETS,CR_datasets}/Sen2_MTC_New
+    sen2mtc_old: ${oc.env:CR_DATASETS,CR_datasets}/Sen2_MTC_Old
+    tcloud: ${oc.env:CR_DATASETS,CR_datasets}/T-CLOUD
+    rice: ${oc.env:CR_DATASETS,CR_datasets}/RICE/RICE1
+    rice2: ${oc.env:CR_DATASETS,CR_datasets}/RICE/RICE2
+    cuhk_cr: ${oc.env:CR_DATASETS,CR_datasets}/C-CUHK/CUHK-CR1
+    cuhk_cr2: ${oc.env:CR_DATASETS,CR_datasets}/C-CUHK/CUHK-CR2
+  corpus_weights:
+    allclear: 0.531
+    sen12mscr: 0.329
+    whus2crv: 0.088
+    sen2mtc_old: 0.020
+    sen2mtc_new: 0.011
+    tcloud: 0.011
+    rice: 0.0019
+    rice2: 0.0027
+    cuhk_cr: 0.0025
+    cuhk_cr2: 0.0021
+  train_split: train
+  resolution: 256
+  k_choices: [1, 2, 3]
+  k_probs: [0.3, 0.2, 0.5]
+  k_ramp_steps: 10000
+  s1_max: 1
+  s1_drop: 0.3
+  sar_only_frac: 0.05
+  p_uncond: 0.1
+model:
+  ae_path: weights/vae/ae.safetensors
+  klein_path: weights/klein/flux-2-klein-base-4b.safetensors
+  stems_path: weights/stems/stems.safetensors
+  ms_enabled: true
+  ms_stems: ["10", "10b", "1"]
+flow:
+  time_scheme: logit_normal
+  shift: 1.36
+loss:
+  ms_weight: 1.0
+train:
+  seed: 2026
+  output_dir: runs/pretrain
+  steps: 500000
+  batch_size: 8
+  grad_accum: 2
+  lr: 1.0e-4
+  weight_decay: 0.0
+  warmup_steps: 2000
+  min_lr: 1.0e-6
+  max_grad_norm: 1.0
+  ema_decay: 0.9999
+  mixed_precision: bf16
+  compile: true
+  ckpt_keep: 2

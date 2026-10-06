@@ -1,0 +1,634 @@
+diff --git a/geocr_bench/__init__.py b/geocr_bench/__init__.py
+new file mode 100644
+index 0000000..f4997a2
+--- /dev/null
++++ b/geocr_bench/__init__.py
+@@ -0,0 +1 @@
++"""Split-list datasets and the prediction/manifest writer for EMRDM."""
+diff --git a/geocr_bench/datasets.py b/geocr_bench/datasets.py
+new file mode 100644
+index 0000000..a7ed415
+--- /dev/null
++++ b/geocr_bench/datasets.py
+@@ -0,0 +1,141 @@
++"""Split-list datasets for EMRDM on T-CLOUD, CUHK-CR1/2 and WHUS2-CRv."""
++from __future__ import annotations
++
++import os
++import sys
++from pathlib import Path
++
++import numpy as np
++import torch
++from torch.utils.data import Dataset
++
++GEOCR_ROOT = Path(os.environ.get("GEOCR_ROOT", Path(__file__).resolve().parents[2] / "GeoCR"))
++BASELINES = Path(os.environ.get("GEOCR_BASELINES", GEOCR_ROOT / "baselines" / "common"))
++for _p in (str(BASELINES / "exporters"), str(GEOCR_ROOT)):
++    if _p not in sys.path:
++        sys.path.insert(0, _p)
++
++
++def _exporters():
++    try:
++        from _common import geocr_import, sid_flat
++        from export_display8 import CORPORA, CORPUS_ALIASES, clear_id
++        from export_whus2 import fuse13
++    except Exception as exc:
++        raise SystemExit(
++            f"cannot import the exporters from {BASELINES/'exporters'}: {exc}; "
++            "set GEOCR_BASELINES"
++        ) from exc
++    return dict(g=geocr_import(), sid_flat=sid_flat, CORPORA=CORPORA,
++                ALIASES=CORPUS_ALIASES, clear_id=clear_id, fuse13=fuse13)
++
++
++def sid_flat(sid: str) -> str:
++    return sid.replace("/", "__")
++
++
++def read_split(root: Path, split: str, splits_dir: str = "splits",
++               limit: int = 0, split_file: str | None = None) -> list[str]:
++    p = Path(split_file) if split_file else Path(root) / splits_dir / f"{split}.txt"
++    if not p.is_file():
++        raise SystemExit(f"missing split file {p}")
++    out = [s for s in (ln.split("#", 1)[0].strip() for ln in p.read_text().splitlines()) if s]
++    if not out:
++        raise SystemExit(f"{p} is empty")
++    if limit:
++        out = out[:limit]
++    keys = [sid_flat(s) for s in out]
++    if len(set(keys)) != len(keys):
++        dup = sorted({k for k in keys if keys.count(k) > 1})[:5]
++        raise SystemExit(f"{p}: sid_flat COLLISION on {dup}")
++    return out
++
++
++def _chw_pm1(arr_u8: np.ndarray) -> torch.Tensor:
++    if arr_u8.ndim == 2:
++        arr_u8 = arr_u8[..., None]
++    t = torch.from_numpy(np.ascontiguousarray(arr_u8, dtype=np.float32)).permute(2, 0, 1)
++    return t / 255.0 * 2.0 - 1.0
++
++
++class Display8SplitDataset(Dataset):
++
++    def __init__(self, corpus: str, split: str, root: str | None = None,
++                 splits_dir: str = "splits", resolution: int | None = None,
++                 nir: bool | None = None, export_root: str | None = None,
++                 limit: int = 0, split_file: str | None = None):
++        super().__init__()
++        E = _exporters()
++        self.g, self.clear_id = E["g"], E["clear_id"]
++        corpus = E["ALIASES"].get(corpus, corpus)
++        if corpus not in E["CORPORA"]:
++            raise SystemExit(f"unknown display8 corpus {corpus}; "
++                             f"have {list(E['CORPORA'])}")
++        self.corpus = corpus
++        self.cfg = dict(E["CORPORA"][corpus])
++        self.root = Path(root) if root else self.cfg["root"]
++        self.res = resolution or self.cfg["target_res"]
++        self.nir = self.cfg["nir"] if nir is None else bool(nir)
++        self.export = Path(export_root) / corpus / split if export_root else None
++        if self.export is not None and not self.export.is_dir():
++            raise SystemExit(f"export_root given but {self.export} is not a directory")
++        self.nir_root = self.root.parent / "nir" / self.root.name
++
++        self.sids = read_split(self.root, split, splits_dir, limit, split_file)
++        self.keys = [sid_flat(s) for s in self.sids]
++        self.cids = []
++        for sid in self.sids:
++            cid = self.clear_id(sid, self.cfg, self.root)
++            if cid is None:
++                raise SystemExit(f"{self.root/sid}: no clear pair via "
++                                 f"{self.cfg['clear_sub']}")
++            self.cids.append(cid)
++
++    def __len__(self) -> int:
++        return len(self.sids)
++
++    def _png(self, sub: str, key: str, rel: str, want_nir: bool) -> np.ndarray:
++        if self.export is not None:
++            a = self.g["read_png"](self.export / sub / key)
++        else:
++            a = self.g["read_png"]((self.nir_root if want_nir else self.root) / rel)
++            if want_nir and a.ndim == 3:
++                a = a[..., 0]
++            a = self.g["resize_u8"](a, self.res)
++        return a
++
++    def __getitem__(self, i: int) -> dict:
++        key, sid, cid = self.keys[i], self.sids[i], self.cids[i]
++        x = _chw_pm1(self._png("cloudy", key, sid, False))[:3]
++        t = _chw_pm1(self._png("clear", key, cid, False))[:3]
++        if self.nir:
++            xn = _chw_pm1(self._png("cloudy_nir", key, sid, True))[:1]
++            tn = _chw_pm1(self._png("clear_nir", key, cid, True))[:1]
++            x, t = torch.cat([x, xn], 0), torch.cat([t, tn], 0)
++        return {"cond_image": x, "label": t, "cloudy": x[:3],
++                "image_path": f"{Path(key).stem}.png"}
++
++
++class WHUS2SplitDataset(Dataset):
++
++    def __init__(self, root: str, split: str, splits_dir: str = "splits",
++                 limit: int = 0, split_file: str | None = None):
++        super().__init__()
++        E = _exporters()
++        self.g, self.fuse13 = E["g"], E["fuse13"]
++        self.root = Path(root)
++        self.sids = read_split(self.root, split, splits_dir, limit, split_file)
++        self.keys = [sid_flat(s) for s in self.sids]
++
++    def __len__(self) -> int:
++        return len(self.sids)
++
++    def _band13(self, sid: str, role: str) -> torch.Tensor:
++        a = self.fuse13(self.root, sid, role, self.g).astype(np.float32) / 10000.0
++        return torch.from_numpy(a) * 2.0 - 1.0
++
++    def __getitem__(self, i: int) -> dict:
++        sid, key = self.sids[i], self.keys[i]
++        return {"target": self._band13(sid, "clear"),
++                "S2": self._band13(sid, "cloud"),
++                "image_path": f"{Path(key).stem}.tif"}
+diff --git a/geocr_bench/datasets_mtc.py b/geocr_bench/datasets_mtc.py
+new file mode 100644
+index 0000000..d63c936
+--- /dev/null
++++ b/geocr_bench/datasets_mtc.py
+@@ -0,0 +1,42 @@
++"""Sen2_MTC_New split-list dataset (three cloudy frames) on top of the upstream loader."""
++from __future__ import annotations
++
++from pathlib import Path
++
++import numpy as np
++from torch.utils.data import Dataset
++
++from geocr_bench.datasets import read_split, sid_flat
++
++
++def _mtc():
++    from sgm.data.sen2_mtc_new.sen2_mtc_new import Sen2_MTC_New_Multi
++    return Sen2_MTC_New_Multi
++
++
++class Sen2MTCNewSplitDataset(_mtc()):
++
++    def __init__(self, root, split="train", splits_dir="splits", use_ir=True,
++                 mono_temporal=-1, multi_temporal=3, limit: int = 0,
++                 split_file: str | None = None):
++        Dataset.__init__(self)
++        assert multi_temporal in [2, 3], "multi_temporal should be 2 or 3"
++        self.data_root = str(root)
++        self.mode = split
++        self.use_ir = use_ir
++        self.mono_temporal = mono_temporal
++        self.multi_temporal = multi_temporal
++
++        self.sids = read_split(Path(root), split, splits_dir, limit, split_file)
++        self.filepair, self.image_name = [], []
++        for sid in self.sids:
++            tgt = Path(root) / sid
++            stem = tgt.stem
++            cloud = tgt.parent.parent / "cloud"
++            frames = [str(cloud / f"{stem}_{i}.tif") for i in range(3)]
++            self.filepair.append(frames + [str(tgt)])
++            self.image_name.append(Path(sid_flat(sid)).stem)
++
++        self.augment_rotation_param = np.random.randint(0, 4, len(self.filepair))
++        self.augment_flip_param = np.random.randint(0, 3, len(self.filepair))
++        self.index = 0
+diff --git a/geocr_bench/datasets_sen12.py b/geocr_bench/datasets_sen12.py
+new file mode 100644
+index 0000000..5ad104a
+--- /dev/null
++++ b/geocr_bench/datasets_sen12.py
+@@ -0,0 +1,39 @@
++"""SEN12MS-CR split-list dataset on top of the upstream loader."""
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++from geocr_bench.datasets import read_split, sid_flat
++
++
++def _sen12():
++    from sgm.data.sentinel.sentinel import SEN12MSCRInterface
++    return SEN12MSCRInterface
++
++
++class SEN12MSCRSplitDataset(_sen12()):
++
++    def __init__(self, root, split="train", splits_dir="splits", region="all",
++                 cloud_masks=None, rescale=True, return_target=True,
++                 limit: int = 0, split_file: str | None = None):
++        self._split_kw = dict(splits_dir=splits_dir, limit=limit, split_file=split_file)
++        super().__init__(root=root, split=split, region=region,
++                         cloud_masks=cloud_masks, rescale=rescale,
++                         return_target=return_target)
++
++    def get_paths(self):
++        sids = read_split(Path(self.root_dir), self.split, **self._split_kw)
++        self.sids = sids
++        self.stems = [Path(sid_flat(s)).stem for s in sids]
++        out = []
++        for sid in sids:
++            out.append({"S2_cloudy": os.path.join(self.root_dir, sid),
++                        "S2": os.path.join(self.root_dir, sid.replace("s2_cloudy", "s2")),
++                        "S1": os.path.join(self.root_dir, sid.replace("s2_cloudy", "s1"))})
++        return out
++
++    def __getitem__(self, pdx):
++        out = super().__getitem__(pdx)
++        out["image_path"] = f"{self.stems[pdx]}.tif"
++        return out
+diff --git a/geocr_bench/dump.py b/geocr_bench/dump.py
+new file mode 100644
+index 0000000..e38adbc
+--- /dev/null
++++ b/geocr_bench/dump.py
+@@ -0,0 +1,279 @@
++"""Prediction writer used by predict_step, and the manifest writer/validator for one dump."""
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import numpy as np
++
++REPO = Path(__file__).resolve().parent.parent
++GEOCR_ROOT = Path(os.environ.get("GEOCR_ROOT", REPO.parent / "GeoCR"))
++BASELINES = Path(os.environ.get("GEOCR_BASELINES", GEOCR_ROOT / "baselines" / "common"))
++
++CODE_PATCHES = [
++    "sgm/data/sentinel/sentinel.py: exact ROI split match; path-cache name and location",
++    "sgm/models/diffusion.py: dump_dir/dump_dtype/dump_channels; image_path_key; "
++    "float dump before scale_01",
++    "sgm/modules/diffusionmodules/k_diffusion/image_transformer.py: natten has_fused_na fallback",
++]
++
++
++def write_pred(engine, batch, samples) -> Path:
++    key = engine.get_input(batch, getattr(engine, "image_path_key", "image_path"))[0]
++    if isinstance(key, (list, tuple)):
++        key = key[0]
++    stem = Path(str(key)).stem
++    if not stem:
++        raise RuntimeError("empty dump key: the loader must set image_path to the sample id")
++    arr = ((samples[0].float() + 1.0) / 2.0).detach().cpu().numpy()
++    want_ch = int(getattr(engine, "dump_channels", 0) or 0)
++    if want_ch and arr.shape[0] < want_ch:
++        pad = np.full((want_ch - arr.shape[0], *arr.shape[1:]), np.nan,
++                      dtype=np.float32)
++        arr = np.concatenate([arr, pad], axis=0)
++    elif want_ch and arr.shape[0] > want_ch:
++        raise RuntimeError(f"{stem}: model emitted {arr.shape[0]} channels but the "
++                           f"corpus declares {want_ch}; refusing to truncate")
++    dtype = getattr(engine, "dump_dtype", "float32")
++    if dtype not in ("float32", "float16"):
++        raise ValueError(f"dump_dtype must be float32 or float16, got {dtype!r}")
++    out = Path(engine.dump_dir) / "preds"
++    out.mkdir(parents=True, exist_ok=True)
++    p = out / f"{stem}.npy"
++    np.save(p, np.ascontiguousarray(arr, dtype=np.dtype(dtype)))
++    return p
++
++
++def _sha256(p: Path) -> str:
++    h = hashlib.sha256()
++    with open(p, "rb") as fh:
++        for c in iter(lambda: fh.read(1 << 20), b""):
++            h.update(c)
++    return h.hexdigest()
++
++
++def _git_rev() -> str:
++    try:
++        return subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
++                              capture_output=True, text=True, check=True).stdout.strip()
++    except Exception:
++        return "unknown"
++
++
++def _rescore():
++    for p in (str(BASELINES), str(GEOCR_ROOT)):
++        if p not in sys.path:
++            sys.path.insert(0, p)
++    import rescore
++    return rescore
++
++
++RUN_FACTS = {
++    "tcloud":      dict(frames_used=1, frame_rule="n/a", sar_used=False),
++    "cuhk_cr1":    dict(frames_used=1, frame_rule="n/a", sar_used=False),
++    "cuhk_cr2":    dict(frames_used=1, frame_rule="n/a", sar_used=False),
++    "whus2crv":    dict(frames_used=1, frame_rule="n/a", sar_used=False),
++    "sen12mscr":   dict(frames_used=1, frame_rule="n/a", sar_used=True),
++    "sen2mtc_new": dict(frames_used=3,
++                        frame_rule="all three cloudy frames (multi_temporal=3, upstream)",
++                        sar_used=False),
++}
++
++DISPLAY8 = ("tcloud", "cuhk_cr1", "cuhk_cr2")
++
++BANDS_PREDICTED = {
++    "sen2mtc_new": ["R", "G", "B"],
++}
++
++
++def build_manifest(args) -> dict:
++    R = _rescore()
++    corpus = R.resolve_corpus(args.corpus)
++    if corpus not in R.CORPORA:
++        raise SystemExit(f"unknown corpus {corpus}; have {list(R.CORPORA)}")
++    cfg = R.CORPORA[corpus]
++    root = Path(args.root) if args.root else cfg["root"]
++    sp = root / args.splits_dir / f"{args.split}.txt"
++    ids = R.read_split(root, args.split, args.splits_dir)
++    facts = RUN_FACTS[corpus]
++
++    native = cfg["resolution"]
++    resample = {"op": "none", "reason": "native resolution"}
++    if corpus in DISPLAY8:
++        sys.path.insert(0, str(BASELINES / "exporters"))
++        from export_display8 import CORPORA as E1
++        native = [E1[corpus]["native"]] * 2
++        if native != cfg["resolution"]:
++            resample = {"op": "PIL.BICUBIC",
++                        "via": "geocr.data.benchmarks._resize_u8",
++                        "where": "exporter" if args.export_root else "loader",
++                        "stage": "pre-inference"}
++
++    bands, bands_note, reconcile = cfg["bands"], None, None
++    predicted = BANDS_PREDICTED.get(corpus)
++    if predicted is not None and len(predicted) < len(bands):
++        bands_note = (f"model predicts {len(predicted)} bands {predicted}; planes "
++                      f"{len(predicted)}..{len(bands) - 1} are NaN")
++        print(f"[emrdm-dump] {corpus}: padding {len(predicted)} -> {len(bands)} "
++              f"channels with NaN.\n  {bands_note}")
++
++    train_sp = root / args.splits_dir / f"{args.train_split}.txt"
++    man = {
++        "corpus": corpus, "split": args.split,
++        "split_list": str(sp), "split_list_sha256": _sha256(sp), "n_items": len(ids),
++        "resolution": cfg["resolution"], "native_resolution": native,
++        "resample": resample, "crop": "none",
++        "bands": bands, "domain": cfg["domain"],
++        "dtype": _measured_dtype(Path(args.dump_dir), args.dump_dtype),
++        "processing_level": cfg["level"],
++        "method": args.method, "method_variant": args.method_variant,
++        "code_rev": _git_rev(), "code_patches": CODE_PATCHES,
++        "ckpt_sha256": _sha256(Path(args.ckpt)) if args.ckpt else None,
++        "ckpt_path": args.ckpt, "ckpt_selection": args.ckpt_selection,
++        "train_split": args.train_split,
++        "train_split_sha256": _sha256(train_sp) if train_sp.is_file() else None,
++        "n_train": len(R.read_split(root, args.train_split, args.splits_dir))
++                   if train_sp.is_file() else None,
++        "splits_dir": args.splits_dir,
++        "exclude_list": args.exclude, "seed": args.seed,
++        "sampler": {"type": args.sampler, "nfe": args.nfe},
++        "frames_used": facts["frames_used"], "frame_rule": facts["frame_rule"],
++        "sar_used": facts["sar_used"],
++        "sar_fill": "none" if facts["sar_used"] else "n/a",
++        "steps_used": args.steps_used, "step_ceiling": args.step_ceiling,
++        "ceiling_hit": (None if args.steps_used is None or args.step_ceiling is None
++                        else args.steps_used >= args.step_ceiling),
++        "epochs_used": args.epochs_used,
++        "dev_evaluations_consumed": args.dev_evals,
++        "dev_slope_last10": args.dev_slope_last10,
++        "batch_global": args.batch_global, "microbatch": args.microbatch,
++        "grad_accum": args.grad_accum, "lr": args.lr,
++        "wall_clock_h": args.wall_clock_h, "gpu": args.gpu,
++        "params_trainable": args.params_trainable,
++        "params_total": args.params_total,
++        "precision": "fp32 (TF32 matmul via --enable_tf32)",
++        "bands_predicted": predicted or bands,
++        "bands_note": bands_note,
++        "scorer_reconciliation_required": reconcile,
++        "notes": args.note or None,
++    }
++    return man, root, ids
++
++
++def _measured_dtype(dump_dir: Path, claimed: str) -> str:
++    files = sorted((dump_dir / "preds").glob("*.npy"))
++    if not files:
++        return claimed
++    seen = {str(np.load(f, mmap_mode="r").dtype) for f in files[:16]}
++    if len(seen) != 1:
++        raise SystemExit(f"mixed pred dtypes {sorted(seen)} in {dump_dir}/preds")
++    got = seen.pop()
++    if got != claimed:
++        print(f"[emrdm-dump] WARNING: --dump-dtype said {claimed} but files are "
++              f"{got}; manifest records {got}")
++    return got
++
++
++def validate(dump_dir: Path, man: dict, ids: list[str]) -> list[str]:
++    R = _rescore()
++    problems = []
++    preds = dump_dir / "preds"
++    if not preds.is_dir():
++        return [f"{preds} does not exist -- did predict_step run with dump_dir set?"]
++    stems = {Path(R.sid_flat(s)).stem for s in ids}
++    have = {p.stem for p in preds.glob("*.npy")}
++    if have != stems:
++        miss, extra = sorted(stems - have)[:5], sorted(have - stems)[:5]
++        problems.append(f"dump key set != split list "
++                        f"(split {len(stems)}, dump {len(have)}); "
++                        f"missing {miss}; unexpected {extra}")
++    nch = len(man["bands"])
++    n_pred = len(man.get("bands_predicted") or man["bands"])
++    res = tuple(man["resolution"])
++    for p in sorted(preds.glob("*.npy")):
++        a = np.load(p)
++        if a.ndim != 3:
++            problems.append(f"{p.name}: expected CHW, got {a.shape}")
++        elif a.shape[0] != nch:
++            problems.append(f"{p.name}: {a.shape[0]} channels, corpus declares {nch}")
++        elif tuple(a.shape[1:]) != res:
++            problems.append(f"{p.name}: {tuple(a.shape[1:])} != resolution {res}")
++        elif a.dtype not in (np.float32, np.float16):
++            problems.append(f"{p.name}: dtype {a.dtype}, contract says float32/float16")
++        elif not np.isfinite(a[:n_pred]).all():
++            problems.append(f"{p.name}: non-finite values in predicted planes")
++        elif n_pred < nch and not np.isnan(a[n_pred:]).all():
++            problems.append(f"{p.name}: pad planes must be all-NaN")
++        if len(problems) > 12:
++            problems.append("... further problems suppressed")
++            break
++    return problems
++
++
++def main() -> int:
++    import argparse
++    ap = argparse.ArgumentParser(
++        description="Write and validate the manifest for one EMRDM dump run.",
++        formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--dump-dir", required=True,
++                    help="the run dir: dumps/<corpus>/<split>/emrdm/<run_id>")
++    ap.add_argument("--corpus", required=True)
++    ap.add_argument("--split", default="test")
++    ap.add_argument("--splits-dir", default="splits")
++    ap.add_argument("--root", default=None, help="override the corpus root")
++    ap.add_argument("--export-root", default=None,
++                    help="set if the loader read the PNG export (recorded in the manifest)")
++    ap.add_argument("--method", default="emrdm")
++    ap.add_argument("--method-variant", default="", help="e.g. configs_geocr/tcloud.yaml")
++    ap.add_argument("--ckpt", default=None)
++    ap.add_argument("--ckpt-selection", default="final")
++    ap.add_argument("--train-split", default="trainval")
++    ap.add_argument("--exclude", default=None)
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--sampler", default="ResidualEulerEDMSampler")
++    ap.add_argument("--nfe", type=int, default=4)
++    ap.add_argument("--dump-dtype", default="float32", choices=["float32", "float16"])
++    ap.add_argument("--steps-used", type=int, default=None)
++    ap.add_argument("--step-ceiling", type=int, default=None)
++    ap.add_argument("--epochs-used", type=float, default=None)
++    ap.add_argument("--dev-evals", type=int, default=None)
++    ap.add_argument("--dev-slope-last10", type=float, default=None)
++    ap.add_argument("--batch-global", type=int, default=None)
++    ap.add_argument("--microbatch", type=int, default=None)
++    ap.add_argument("--grad-accum", type=int, default=1)
++    ap.add_argument("--lr", type=float, default=None)
++    ap.add_argument("--wall-clock-h", type=float, default=None)
++    ap.add_argument("--gpu", default="B200x1")
++    ap.add_argument("--params-trainable", type=int, default=None)
++    ap.add_argument("--params-total", type=int, default=None)
++    ap.add_argument("--note", default="")
++    ap.add_argument("--no-validate", action="store_true")
++    args = ap.parse_args()
++
++    man, root, ids = build_manifest(args)
++    dump_dir = Path(args.dump_dir)
++    problems = [] if args.no_validate else validate(dump_dir, man, ids)
++    if problems:
++        print(f"[emrdm-dump] REFUSING to write a manifest for {dump_dir}:")
++        for p in problems:
++            print("  " + p)
++        return 2
++    dump_dir.mkdir(parents=True, exist_ok=True)
++    (dump_dir / "manifest.json").write_text(json.dumps(man, indent=2) + "\n")
++    print(f"[emrdm-dump] {dump_dir}/manifest.json")
++    print(f"  corpus={man['corpus']} split={man['split']} n_items={man['n_items']} "
++          f"bands={len(man['bands'])} res={man['resolution']} "
++          f"level={man['processing_level']} dtype={man['dtype']}")
++    print(f"  split_list={man['split_list']}")
++    if not args.no_validate:
++        print(f"  validated: {man['n_items']} preds, key set == split list, "
++              f"shapes/dtype/finiteness OK")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/sgm/data/sentinel/sentinel.py b/sgm/data/sentinel/sentinel.py
+index a276095..233c645 100644
+--- a/sgm/data/sentinel/sentinel.py
++++ b/sgm/data/sentinel/sentinel.py
+@@ -668,9 +668,11 @@ class SEN12MSCR(Dataset):
+     def get_paths(self):  # assuming for the same ROI+num, the patch numbers are the same
+         print(f'\nProcessing paths for {self.split} split of region {self.region}')
+ 
+-        if os.path.exists(os.path.join(self.root_dir, f'{self.region}_{self.split}_paths.pkl')):
+-            print(f"Loading paths from {self.root_dir}")
+-            with open(os.path.join(self.root_dir, f'{self.region}_{self.split}_paths.pkl'), 'rb') as f:
++        cache_dir  = os.environ.get('EMRDM_PATHS_CACHE_DIR', self.root_dir)
++        cache_name = f'{self.region}_{self.split}_paths.exactroi.pkl'
++        if os.path.exists(os.path.join(cache_dir, cache_name)):
++            print(f"Loading paths from {cache_dir}")
++            with open(os.path.join(cache_dir, cache_name), 'rb') as f:
+                 paths = pickle.load(f)
+                 return paths
+         paths = []
+@@ -687,7 +689,7 @@ class SEN12MSCR(Dataset):
+                     # omit patches that are potentially unpaired
+                     if not all([os.path.isfile(paths_S1[pdx]), os.path.isfile(paths_S2[pdx]), os.path.isfile(paths_S2_cloudy[pdx])]): continue
+                     # don't add patch if not belonging to the selected split
+-                    if not any([split_roi in paths_S1[pdx] for split_roi in self.splits[self.split]]): continue
++                    if os.path.join(seed, roi) not in self.splits[self.split]: continue
+                     # omit the imgs which do not end with tif
+                     if (not paths_S1[pdx].endswith(".tif")) or (not paths_S2[pdx].endswith(".tif")) or (not paths_S2_cloudy[pdx].endswith(".tif")): 
+                         warnings.warn(f"omit {paths_S1[pdx]},{paths_S2[pdx]},{[paths_S2_cloudy[pdx]]}")
+@@ -696,7 +698,8 @@ class SEN12MSCR(Dataset):
+                               "S2":         paths_S2[pdx],
+                               "S2_cloudy":  paths_S2_cloudy[pdx]}
+                     paths.append(sample)
+-        with open(os.path.join(self.root_dir, f'{self.region}_{self.split}_paths.pkl'), 'wb') as f:
++        os.makedirs(cache_dir, exist_ok=True)
++        with open(os.path.join(cache_dir, cache_name), 'wb') as f:
+             pickle.dump(paths, f)
+         return paths
+ 
+diff --git a/sgm/models/diffusion.py b/sgm/models/diffusion.py
+index 26328f5..82de818 100644
+--- a/sgm/models/diffusion.py
++++ b/sgm/models/diffusion.py
+@@ -344,7 +344,7 @@ class DiffusionEngine(pl.LightningModule):
+         return log
+ 
+ class ResidualDiffusionEngine(DiffusionEngine):
+-    def __init__(self, sigma_st_config, to_rgb_config, scale_01_config=None, ideal_sampler_config = None, mean_key="mu", use_flash_attn2 = False, compile_model = False, image_metrics="metrics", count_train_time=False, count_sample_time=False,*args, **kwargs):
++    def __init__(self, sigma_st_config, to_rgb_config, scale_01_config=None, ideal_sampler_config = None, mean_key="mu", use_flash_attn2 = False, compile_model = False, image_metrics="metrics", count_train_time=False, count_sample_time=False, dump_dir=None, dump_dtype="float32", dump_channels=None,*args, **kwargs):
+         if compile_model:
+             os.environ["USE_COMPILE"] = "1"
+         else:
+@@ -366,6 +366,9 @@ class ResidualDiffusionEngine(DiffusionEngine):
+             self.avg_metrics = avg_img_metrics()
+         super().__init__(compile_model=compile_model, *args, **kwargs)
+         self.mean_key = mean_key
++        self.dump_dir = dump_dir
++        self.dump_dtype = dump_dtype
++        self.dump_channels = dump_channels
+         self.sigma2st = instantiate_from_config(sigma_st_config)
+         self.scale_01 = instantiate_from_config(
+             default(scale_01_config, {"target": "sgm.util.scale_01_from_minus1_1"})
+@@ -725,9 +728,14 @@ class ResidualDiffusionEngine(DiffusionEngine):
+             )
+             samples = self.decode_first_stage(samples)
+ 
++        if self.dump_dir is not None:
++            from geocr_bench.dump import write_pred
++            write_pred(self, batch, samples)
++            return
++
+         path = self.logger.save_dir + "/sample/"
+         os.makedirs(path, exist_ok=True)
+-        image_path = self.get_input(batch, "image_path")[0]
++        image_path = self.get_input(batch, getattr(self, "image_path_key", "image_path"))[0]
+         image_path = image_path.split("/")[-1]
+         _, image_path_extension  = os.path.splitext(image_path)
+         target = self.get_input(batch, self.input_key)
+@@ -1041,6 +1049,11 @@ class TemporalResidualDiffusionEngine(ResidualDiffusionEngine):
+             )
+             samples = self.decode_first_stage(samples)
+ 
++        if self.dump_dir is not None:
++            from geocr_bench.dump import write_pred
++            write_pred(self, batch, samples)
++            return
++
+         attns = others["attns"]
+         attn = attns[-1]
+         # 只拿最后一个头的attn
+diff --git a/sgm/modules/diffusionmodules/k_diffusion/image_transformer.py b/sgm/modules/diffusionmodules/k_diffusion/image_transformer.py
+index a83aa02..11f9fcc 100644
+--- a/sgm/modules/diffusionmodules/k_diffusion/image_transformer.py
++++ b/sgm/modules/diffusionmodules/k_diffusion/image_transformer.py
+@@ -403,7 +403,7 @@ class NeighborhoodSelfAttentionBlock(nn.Module):
+         qkv = self.qkv_proj(x)
+         if natten is None:
+             raise ModuleNotFoundError("natten is required for neighborhood attention")
+-        if natten.has_fused_na():
++        if getattr(natten, "has_fused_na", lambda: hasattr(natten.functional, "na2d"))():
+             q, k, v = rearrange(qkv, "n h w (t nh e) -> t n h w nh e", t=3, e=self.d_head)
+             q, k = scale_for_cosine_sim(q, k, self.scale[:, None], 1e-6)
+             theta = self.pos_emb(pos)

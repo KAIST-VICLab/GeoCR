@@ -1,0 +1,31 @@
+corpus: tcloud
+source: native
+export_root: ${CR_EXPORTS}
+dumps_root: ${OUT}/dumps
+out_dir: ${OUT}/runs/tcloud
+
+max_steps: 20000
+batchsize: 32
+validation_batchsize: 32
+train_split: trainval
+ckpt_selection: final
+ckpt_every: 500
+epoch: 273
+lr: 0.00067272
+lr_grid: [0.00067272]
+seeds: [0]
+manualSeed: 0
+width: 256
+height: 256
+
+cuda: true
+gpu_ids: []
+threads: 8
+beta1: 0.5
+lamb: 100
+in_ch: 3
+out_ch: 3
+minimax: 1
+gen_init:
+dis_init:
+snapshot_interval: 10

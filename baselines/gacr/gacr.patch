@@ -1,0 +1,1248 @@
+diff --git a/dataset.py b/dataset.py
+index 4153e9f..3bd081f 100755
+--- a/dataset.py
++++ b/dataset.py
+@@ -18,6 +18,8 @@ class CRDataset(Dataset):
+         self.mode = mode
+         if self.mode == 'train':
+             img_list = np.loadtxt(os.path.join(data_dir, 'train.txt'), dtype=str)
++        elif self.mode == 'val':
++            img_list = np.loadtxt(os.path.join(data_dir, 'val.txt'), dtype=str)
+         else:
+             img_list = np.loadtxt(os.path.join(data_dir, 'test.txt'), dtype=str)
+             if val_size is not None:
+diff --git a/dump.py b/dump.py
+new file mode 100644
+index 0000000..5ec59ab
+--- /dev/null
++++ b/dump.py
+@@ -0,0 +1,215 @@
++#!/usr/bin/env python
++"""Write GACR predictions (keyed per-sample noise) as CHW .npy files plus a manifest."""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import numpy as np
++import torch
++from torch.utils.data import DataLoader
++from tqdm.auto import tqdm
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE))
++
++from engine import OARFlowEngine
++from geocr_data import (
++    GeoCRSplitDataset, corpus_cfg, sample_noise, sid_flat, split_sha256,
++    to_dump_domain,
++)
++from models.k_diffusion import image_transformer
++from test import dict_to_namespace, namespace_to_dict, strip_prefix
++
++
++def sha256_file(p: Path) -> str:
++    h = hashlib.sha256()
++    with open(p, "rb") as fh:
++        for c in iter(lambda: fh.read(1 << 20), b""):
++            h.update(c)
++    return h.hexdigest()
++
++
++def code_rev() -> str:
++    try:
++        return subprocess.run(["git", "-C", str(HERE), "rev-parse", "--short", "HEAD"],
++                              capture_output=True, text=True, timeout=10).stdout.strip()
++    except Exception:
++        return "unknown"
++
++
++CODE_PATCHES = [
++    "dataset.py: val branch",
++    "train.py: dataset.kind dispatch, GCPA native resolution, global batch with "
++    "gradient accumulation, dev evaluation, dataset.train_split, logging.dev_select, --set",
++    "engine.py: token-count guard, injectable sampling noise",
++    "test.py: no val_size truncation of the test set, --set",
++    "models/sgm/evaluator.py: lazy lpips, resolution-free 4-band branch",
++    "models/k_diffusion/{layers,image_transformer}.py: optional dctorch, natten has_fused_na fallback",
++    "new: geocr_data.py dump.py vfm_hub/hubconf.py",
++]
++
++
++def build_model(config, device):
++    model = image_transformer.ImageTransformerDenoiserModelInterface(
++        **namespace_to_dict(config.model)).to(device)
++    model.eval()
++    return model
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description="Write GACR predictions in the dump contract format.")
++    ap.add_argument("--config", required=True)
++    ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
++    ap.add_argument("--ckpt", required=True)
++    ap.add_argument("--state-key", default=None, choices=["ema", "model", "raw"],
++                    help="default: infer from the checkpoint (best_*.pt carry one key)")
++    ap.add_argument("--split", default="test")
++    ap.add_argument("--out", required=True, help="dumps/<corpus>/<split>/gacr/<run_id>")
++    ap.add_argument("--num-steps", type=int, default=None,
++                    help="Euler NFE; default = misc.eval_num_steps from the config")
++    ap.add_argument("--batch-size", type=int, default=8,
++                    help="throughput only; noise is keyed per sample")
++    ap.add_argument("--fp16", action="store_true",
++                    help="float16 output (only for splits of >= 5000 items)")
++    ap.add_argument("--device", default=None)
++    ap.add_argument("--limit", type=int, default=None,
++                    help="predict only the first N items (testing)")
++    ap.add_argument("--train-report", default=None,
++                    help="exps/<exp>/train_report.json; defaults to the one next "
++                         "to --ckpt")
++    a = ap.parse_args()
++
++    from test import apply_overrides_ns, load_config
++    config = apply_overrides_ns(load_config(a.config), a.set)
++    if getattr(config.dataset, "kind", None) != "geocr":
++        raise SystemExit("dump.py requires dataset.kind: geocr")
++    device = torch.device(a.device or ("cuda" if torch.cuda.is_available() else "cpu"))
++    ccfg = corpus_cfg(config.dataset.corpus)
++    nfe = a.num_steps or int(getattr(config.misc, "eval_num_steps", 4))
++    seed = int(config.misc.seed)
++
++    ds = GeoCRSplitDataset(
++        corpus=config.dataset.corpus, split=a.split,
++        splits_dir=getattr(config.dataset, "splits_dir", "splits"),
++        root=getattr(config.dataset, "root", None) or None,
++        cond_frames=getattr(config.dataset, "cond_frames", None),
++        anchor_frame=getattr(config.dataset, "anchor_frame", 0),
++        rgb_view=getattr(config.gcpa, "rgb_view", "model_norm"),
++        max_items=a.limit)
++    if a.fp16 and len(ds.ids) < 5000 and a.limit is None:
++        raise SystemExit(f"--fp16 is permitted only for splits >= 5000 items; "
++                         f"{ccfg['name']}/{a.split} has {len(ds.ids)}")
++
++    ckpt_path = Path(a.ckpt)
++    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
++    key = a.state_key
++    if key in (None, "raw"):
++        cand = [k for k in ("ema", "model", "raw") if k in ck]
++        if key == "raw":
++            cand = [k for k in ("raw", "model") if k in ck]
++        if not cand:
++            raise SystemExit(f"{ckpt_path}: no weight key among {list(ck)}")
++        key = cand[0]
++    if key not in ck:
++        raise SystemExit(f"{ckpt_path} has no key {key!r}; has {list(ck)}")
++    model = build_model(config, device)
++    model.load_state_dict(strip_prefix(ck[key]), strict=True)
++
++    engine = OARFlowEngine(model=model, prediction=config.loss.prediction,
++                           path_type=config.loss.path_type,
++                           weighting=config.loss.weighting,
++                           p=getattr(config.loss, "p", 3.0))
++
++    out = Path(a.out)
++    preds = out / "preds"
++    preds.mkdir(parents=True, exist_ok=True)
++    loader = DataLoader(ds, batch_size=a.batch_size, shuffle=False,
++                        num_workers=int(config.misc.num_workers), pin_memory=True)
++
++    t0 = time.time()
++    written: list[str] = []
++    torch.set_grad_enabled(False)
++    for b in tqdm(loader, desc=f"dump {ccfg['name']}/{a.split}"):
++        mu = b["cloudy"].to(device)
++        cond = b["cond"].to(device)
++        noise = torch.stack([sample_noise(s, tuple(mu.shape[1:]), seed)
++                             for s in b["sid"]]).to(device)
++        samples, _ = engine.sample(cond, mu, uc=cond, batch_size=mu.shape[0],
++                                   shape=mu.shape[1:], num_steps=nfe, noise=noise)
++        dom = to_dump_domain(samples.float().cpu(), ccfg).numpy()
++        for i, sid in enumerate(b["sid"]):
++            arr = dom[i].astype(np.float16 if a.fp16 else np.float32)
++            stem = Path(sid_flat(sid)).stem
++            np.save(preds / f"{stem}.npy", arr)
++            written.append(stem)
++
++    want = {Path(sid_flat(s)).stem for s in ds.ids}
++    have = {p.stem for p in preds.glob("*.npy")}
++    if a.limit is None and have != want:
++        raise SystemExit(
++            f"dump key set != split list: {len(have)} files vs {len(want)} ids "
++            f"(missing {sorted(want - have)[:5]}, extra {sorted(have - want)[:5]})")
++
++    tr = Path(a.train_report) if a.train_report else ckpt_path.parent.parent / "train_report.json"
++    report = json.loads(tr.read_text()) if tr.is_file() else {}
++    if not report:
++        print(f"note: no train_report.json at {tr}; training facts are not copied into the manifest")
++
++    man = {
++        "corpus": ccfg["name"], "split": a.split,
++        "split_list": str(Path(ds.root) / ds.splits_dir / f"{a.split}.txt"),
++        "split_list_sha256": split_sha256(ds.root, a.split, ds.splits_dir),
++        "n_items": len(ds.ids),
++        "resolution": [ccfg["res"], ccfg["res"]],
++        "crop": "none",
++        "bands": ccfg["bands"],
++        "domain": ccfg["domain"],
++        "processing_level": ccfg["level"],
++        "native_resolution": [ccfg["native"], ccfg["native"]],
++        "resample": ({"op": "PIL.BICUBIC(geocr.data.benchmarks._resize_u8)",
++                      "where": "gacr_loader", "stage": "pre-inference"}
++                     if ccfg["native"] != ccfg["res"] else
++                     {"op": "none", "where": "n/a", "stage": "n/a"}),
++        "dtype": "float16" if a.fp16 else "float32",
++        "method": "gacr", "method_variant": Path(a.config).name,
++        "code_rev": code_rev(), "code_patches": CODE_PATCHES,
++        "ckpt": str(ckpt_path), "ckpt_sha256": sha256_file(ckpt_path),
++        "ckpt_state_key": key,
++        "ckpt_selection": report.get("ckpt_selection", "final"),
++        "seed": seed,
++        "sampler": {"type": "euler_oar", "nfe": nfe,
++                    "prior": f"x1 = eps + rho*x_cond, rho={getattr(config.loss,'p',3.0)}",
++                    "grid": "unshifted uniform t: 1 -> 0",
++                    "noise_keying": "blake2b(seed:sid) per sample"},
++        "frames_used": ds.k,
++        "frame_rule": ("n/a" if ccfg["k"] == 1 else
++                       f"anchor = frame index {ds.anchor}; cond = concat of "
++                       f"{ds.k} frames in file order"),
++        "sar_used": False,
++        "sar_fill": "n/a",
++        "gcpa_rgb_view": getattr(config.gcpa, "rgb_view", "model_norm"),
++        "batch_size_inference": a.batch_size,
++        "dump_wall_clock_h": round((time.time() - t0) / 3600.0, 4),
++        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
++        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++    }
++    man.update({k: v for k, v in report.items()
++                if k not in ("corpus", "seed", "ckpt_selection")})
++    if a.limit is not None:
++        man["incomplete"] = f"only the first {a.limit} items were predicted"
++    (out / "manifest.json").write_text(json.dumps(man, indent=2, sort_keys=True) + "\n")
++
++    print(f"\nwrote {len(written)} predictions -> {preds}")
++    print(f"manifest -> {out / 'manifest.json'}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/engine.py b/engine.py
+index 1aac8f6..6d2dedc 100755
+--- a/engine.py
++++ b/engine.py
+@@ -34,7 +34,8 @@ class OARFlowEngine:
+             latents_bias=None,
+             latents_scale=None,
+             loss_stage=None,
+-            p=3.0
++            p=3.0,
++            proj_loss_impl='loop'
+     ):
+         self.model = model
+         self.prediction = prediction
+@@ -45,8 +46,19 @@ class OARFlowEngine:
+         self.p = p
+         self.avg_metrics = avg_img_metrics()
+         self.scale_01 = scale_01()
++        self.proj_loss_impl = proj_loss_impl
+ 
+     def get_proj_loss(self, zs, zs_tilde):
++        n_teacher, n_model = zs[0].shape[0], zs_tilde.shape[1]
++        if n_teacher != n_model:
++            raise ValueError(
++                f"GCPA token-grid mismatch: teacher emits {n_teacher} tokens, "
++                f"the model's mid level has {n_model}. Check model.patch_size "
++                f"([2,2]) and that the GCPA teacher does not resize its input.")
++        if self.proj_loss_impl == "einsum":
++            z = torch.nn.functional.normalize(torch.stack(list(zs)), dim=-1)
++            zt = torch.nn.functional.normalize(zs_tilde, dim=-1)
++            return -(z * zt).sum(dim=-1).mean(dim=-1)
+         proj_loss = 0.
+         bsz = zs[0].shape[0]
+         for i, (z, z_tilde) in enumerate(zip(zs, zs_tilde)):
+@@ -115,8 +127,9 @@ class OARFlowEngine:
+ 
+ 
+     @torch.no_grad()
+-    def sample(self, cond, mu, uc, batch_size=16, shape=None, return_intermediate=False,return_denoised=False, num_steps=4):
+-        randn = torch.randn(batch_size, *shape).to(cond.device)
++    def sample(self, cond, mu, uc, batch_size=16, shape=None, return_intermediate=False,return_denoised=False, num_steps=4, noise=None):
++        randn = (torch.randn(batch_size, *shape).to(cond.device)
++                 if noise is None else noise.to(cond.device))
+         alpha_t, sigma_t, d_alpha_t, d_sigma_t, beta_t, d_beta_t = self.interpolant(t=1.)
+         # xt = (self.p * mu + randn).to(cond.device)
+         xt = sigma_t * randn + beta_t * mu
+diff --git a/geocr_data.py b/geocr_data.py
+new file mode 100644
+index 0000000..6678140
+--- /dev/null
++++ b/geocr_data.py
+@@ -0,0 +1,312 @@
++"""Split-list dataset, keyed noise and output-domain mapping for GACR."""
++from __future__ import annotations
++
++import hashlib
++import os
++import sys
++from pathlib import Path
++
++import numpy as np
++import torch
++from torch.utils.data import Dataset
++
++_WORK = Path(__file__).resolve().parents[1]
++GEOCR_ROOT = Path(os.environ.get("GEOCR_ROOT", _WORK / "GeoCR"))
++BASELINES = Path(os.environ.get("GEOCR_BASELINES", GEOCR_ROOT / "baselines" / "common"))
++CR_DATASETS = Path(os.environ.get("CR_DATASETS", _WORK / "CR_datasets"))
++
++for _p in (str(GEOCR_ROOT), str(BASELINES / "exporters")):
++    if _p not in sys.path:
++        sys.path.insert(0, _p)
++
++
++def geocr_helpers():
++    from geocr.data.benchmarks import _read_png, _read_tif, _resize_u8
++    return dict(read_png=_read_png, read_tif=_read_tif, resize_u8=_resize_u8)
++
++
++CORPORA: dict[str, dict] = {
++    "tcloud": dict(
++        root=CR_DATASETS / "T-CLOUD", kind="display8", c_target=3, k=1,
++        res=256, native=256, level="display8", lineage="tcloud",
++        bands=["R", "G", "B"], domain="unit_float", dev_key="tcloud_psnr",
++        clear_sub=[("/cloud/", "/reference/"), ("/cloud/", "/label/")], nir=False,
++    ),
++    "cuhk_cr1": dict(
++        root=CR_DATASETS / "C-CUHK" / "CUHK-CR1", kind="display8", c_target=4,
++        k=1, res=256, native=512, level="display8", lineage="cuhk",
++        bands=["R", "G", "B", "NIR"], domain="unit_float", dev_key="cuhk_psnr",
++        clear_sub=[("/cloud/", "/label/")], nir=True,
++    ),
++    "cuhk_cr2": dict(
++        root=CR_DATASETS / "C-CUHK" / "CUHK-CR2", kind="display8", c_target=3,
++        k=1, res=256, native=512, level="display8", lineage="cuhk_rgb",
++        bands=["R", "G", "B"], domain="unit_float", dev_key="cuhkrgb_psnr",
++        clear_sub=[("/cloud/", "/label/")], nir=False,
++    ),
++    "sen2mtc_new": dict(
++        root=CR_DATASETS / "Sen2_MTC_New", kind="sen2mtc_new", c_target=4, k=3,
++        res=256, native=256, level="boa", lineage="sen2mtc",
++        bands=["R", "G", "B", "NIR"], domain="reflectance", dev_key="mtc_psnr",
++    ),
++    "whus2crv": dict(
++        root=CR_DATASETS / "WHUS2-CRv" / "extracted", kind="whus2crv",
++        c_target=13, k=1, res=384, native=384, level="boa", lineage="masked13",
++        bands=None, domain="reflectance", dev_key="psnr_all",
++    ),
++    "sen12mscr": dict(
++        root=CR_DATASETS / "SEN12MS-CR", kind="sen12mscr", c_target=13, k=1,
++        res=256, native=256, level="l1c_toa", lineage="masked13",
++        bands=None, domain="reflectance", dev_key="psnr_all",
++    ),
++}
++
++ALIASES = {"cuhk_cr": "cuhk_cr1"}
++
++
++def corpus_cfg(name: str) -> dict:
++    name = ALIASES.get(name, name)
++    if name not in CORPORA:
++        raise SystemExit(f"unknown corpus {name!r}; known: {sorted(CORPORA)}")
++    cfg = dict(CORPORA[name])
++    cfg["name"] = name
++    if cfg["bands"] is None:
++        from geocr.normalize import S2_BANDS
++        cfg["bands"] = list(S2_BANDS)
++    return cfg
++
++
++def sid_flat(sid: str) -> str:
++    return sid.replace("/", "__")
++
++
++def read_split(root: Path, split: str, splits_dir: str = "splits") -> list[str]:
++    p = Path(root) / splits_dir / f"{split}.txt"
++    if not p.is_file():
++        raise SystemExit(f"missing split file {p}")
++    out = [s for s in (ln.split("#", 1)[0].strip()
++                       for ln in p.read_text().splitlines()) if s]
++    if not out:
++        raise SystemExit(f"{p} is empty")
++    return out
++
++
++def split_sha256(root: Path, split: str, splits_dir: str = "splits") -> str:
++    h = hashlib.sha256()
++    with open(Path(root) / splits_dir / f"{split}.txt", "rb") as fh:
++        for c in iter(lambda: fh.read(1 << 20), b""):
++            h.update(c)
++    return h.hexdigest()
++
++
++def sample_noise(sid: str, shape, seed: int, device=None) -> torch.Tensor:
++    key = hashlib.blake2b(f"{seed}:{sid}".encode(), digest_size=8).digest()
++    g = torch.Generator(device="cpu").manual_seed(int.from_bytes(key, "big"))
++    z = torch.randn(*shape, generator=g, dtype=torch.float32)
++    return z if device is None else z.to(device)
++
++
++class GeoCRSplitDataset(Dataset):
++
++    def __init__(self, corpus: str, split: str, splits_dir: str = "splits",
++                 root: str | Path | None = None, max_items: int | None = None,
++                 cond_frames: int | None = None, anchor_frame: int = 0,
++                 rgb_view: str = "model_norm"):
++        self.cfg = corpus_cfg(corpus)
++        self.corpus = self.cfg["name"]
++        self.root = Path(root) if root else self.cfg["root"]
++        self.split = split
++        self.splits_dir = splits_dir
++        self.res = int(self.cfg["res"])
++        self.ids = read_split(self.root, split, splits_dir)
++        if max_items is not None:
++            self.ids = self.ids[:int(max_items)]
++        self.k = int(self.cfg["k"] if cond_frames is None else cond_frames)
++        if not 1 <= self.k <= int(self.cfg["k"]):
++            raise SystemExit(f"cond_frames={self.k} outside 1..{self.cfg['k']} "
++                             f"for {self.corpus}")
++        self.anchor = int(anchor_frame)
++        if rgb_view not in ("model_norm", "display_gain2"):
++            raise SystemExit(f"unknown gcpa rgb_view {rgb_view!r}")
++        self.rgb_view = rgb_view
++        self._h = None
++        self._norms = None
++
++    @property
++    def h(self):
++        if self._h is None:
++            self._h = geocr_helpers()
++        return self._h
++
++    @property
++    def norms(self):
++        if self._norms is None:
++            from geocr.normalize import Norms
++            self._norms = Norms()
++        return self._norms
++
++    def __len__(self) -> int:
++        return len(self.ids)
++
++    def _u8(self, path: Path, want_nir_from: Path | None) -> np.ndarray:
++        rgb = self.h["resize_u8"](self.h["read_png"](path), self.res)
++        if rgb.ndim == 2:
++            rgb = rgb[..., None]
++        rgb = rgb[..., :3]
++        if want_nir_from is None:
++            return rgb
++        n = self.h["read_png"](want_nir_from)
++        n = n[..., 0] if n.ndim == 3 else n
++        return np.concatenate([rgb, self.h["resize_u8"](n, self.res)[..., None]], -1)
++
++    def _display8(self, sid: str) -> tuple[torch.Tensor, torch.Tensor]:
++        cid = None
++        for needle, repl in self.cfg["clear_sub"]:
++            if needle in sid and (self.root / sid.replace(needle, repl)).is_file():
++                cid = sid.replace(needle, repl)
++                break
++        if cid is None:
++            raise FileNotFoundError(f"{sid}: no clear pair under {self.root}")
++        nir_root = (self.root.parent / "nir" / self.root.name
++                    if self.cfg["nir"] else None)
++        cl = self._u8(self.root / cid, nir_root / cid if nir_root else None)
++        cy = self._u8(self.root / sid, nir_root / sid if nir_root else None)
++        f = lambda a: torch.from_numpy(
++            np.ascontiguousarray(a.transpose(2, 0, 1))).float() / 255.0 * 2.0 - 1.0
++        return f(cl), f(cy)[None]
++
++    def _refl13_to_model(self, refl: torch.Tensor) -> torch.Tensor:
++        from geocr.normalize import MS_IDX, RGB_IDX
++        s2 = self.norms.s2
++        out = torch.empty_like(refl)
++        out[list(RGB_IDX)] = s2.rgb_to_model(refl[list(RGB_IDX)][None])[0]
++        out[list(MS_IDX)] = s2.ms_to_model(refl[list(MS_IDX)][None])[0]
++        return out
++
++    def _refl4_to_model(self, refl: torch.Tensor) -> torch.Tensor:
++        s2 = self.norms.s2
++        return torch.cat([s2.rgb_to_model(refl[:3][None])[0],
++                          s2.ms_to_model(refl[3:4][None])[0]], 0)
++
++    def _sen2mtc(self, sid: str):
++        target = self.root / sid
++        cloud_dir = target.parent.parent / "cloud"
++        frames = [cloud_dir / f"{target.stem}_{i}.tif" for i in range(3)]
++        missing = [p for p in frames if not p.is_file()]
++        if missing:
++            raise FileNotFoundError(
++                f"{missing[0]}: expected cloud frames {target.stem}_{{0,1,2}}.tif")
++        rd = lambda p: torch.from_numpy(
++            self.h["read_tif"](p).astype(np.float32)) / 10000.0
++        clear = self._refl4_to_model(rd(target))
++        cond = torch.stack([self._refl4_to_model(rd(p)) for p in frames])
++        return clear, cond
++
++    def _whus2(self, sid: str):
++        from export_whus2 import fuse13
++        g = dict(read_tif=self.h["read_tif"])
++        from geocr.data.benchmarks import WHUS2CRvProvider
++        g["whus2"] = WHUS2CRvProvider
++        rd = lambda role: self._refl13_to_model(torch.from_numpy(
++            fuse13(self.root, sid, role, g).astype(np.float32)) / 10000.0)
++        return rd("clear"), rd("cloud")[None]
++
++    def _sen12mscr(self, sid: str):
++        rd = lambda p: self._refl13_to_model(torch.from_numpy(
++            self.h["read_tif"](p).astype(np.float32)) / 10000.0)
++        return rd(self.root / sid.replace("s2_cloudy", "s2")), \
++            rd(self.root / sid)[None]
++
++    def _rgb_view(self, clear_model: torch.Tensor) -> torch.Tensor:
++        if self.cfg["c_target"] == 3:
++            return clear_model
++        if self.cfg["level"] == "display8":
++            return clear_model[:3]
++        from geocr.normalize import RGB_IDX, RGBVariantNorm
++        idx = list(RGB_IDX) if self.cfg["c_target"] == 13 else [0, 1, 2]
++        if self.rgb_view == "model_norm":
++            return clear_model[idx]
++        refl = self.norms.s2.rgb_to_refl(clear_model[idx][None])
++        return RGBVariantNorm().to_u01(refl)[0] * 2.0 - 1.0
++
++    def __getitem__(self, idx: int) -> dict:
++        sid = self.ids[idx]
++        kind = self.cfg["kind"]
++        if kind == "display8":
++            clear, frames = self._display8(sid)
++        elif kind == "sen2mtc_new":
++            clear, frames = self._sen2mtc(sid)
++        elif kind == "whus2crv":
++            clear, frames = self._whus2(sid)
++        elif kind == "sen12mscr":
++            clear, frames = self._sen12mscr(sid)
++        else:
++            raise SystemExit(f"no loader for kind {kind!r}")
++        frames = frames[: self.k]
++        return {
++            "clear": clear,
++            "cloudy": frames[self.anchor],
++            "cond": frames.reshape(-1, *frames.shape[-2:]),
++            "rgb": self._rgb_view(clear),
++            "sid": sid,
++            "filename": str(self.root / sid),
++        }
++
++
++def to_dump_domain(x_model: torch.Tensor, cfg: dict) -> torch.Tensor:
++    from geocr.normalize import MS_IDX, RGB_IDX, Norms
++    squeeze = x_model.dim() == 3
++    x = x_model[None] if squeeze else x_model
++    if cfg["level"] == "display8":
++        out = (x + 1.0) / 2.0
++    else:
++        s2 = Norms().s2
++        out = torch.empty_like(x)
++        if cfg["c_target"] == 13:
++            out[:, list(RGB_IDX)] = s2.rgb_to_refl(x[:, list(RGB_IDX)])
++            out[:, list(MS_IDX)] = s2.ms_to_refl(x[:, list(MS_IDX)])
++        else:
++            out[:, :3] = s2.rgb_to_refl(x[:, :3])
++            out[:, 3:4] = s2.ms_to_refl(x[:, 3:4])
++    return out[0] if squeeze else out
++
++
++def dev_metrics(pred_model: torch.Tensor, gt_model: torch.Tensor,
++                cfg: dict) -> dict[str, float]:
++    from geocr.metrics import lineages as LIN
++    p = to_dump_domain(pred_model, cfg)
++    g = to_dump_domain(gt_model, cfg)
++    if p.dim() == 3:
++        p, g = p[None], g[None]
++    lin = cfg["lineage"]
++    if lin in ("tcloud", "cuhk", "cuhk_rgb"):
++        p, g = p.detach().cpu(), g.detach().cpu()
++
++    def one(pi, gi):
++        pi, gi = pi[None], gi[None]
++        if lin == "masked13":
++            from geocr.metrics.masked import masked_ergas, masked_metrics
++            from geocr.normalize import S2_BANDS
++            nb10 = [i for i, b in enumerate(S2_BANDS) if b != "B10"]
++            m = torch.ones(1, 1, *pi.shape[-2:], device=pi.device, dtype=pi.dtype)
++            out = masked_metrics(pi.clamp(0, 1), gi.clamp(0, 1), m)
++            out["ergas_no_b10"] = masked_ergas(pi[:, nb10].clamp(0, 1),
++                                               gi[:, nb10].clamp(0, 1), m)
++            return out
++        if lin == "sen2mtc":
++            from geocr.metrics.sen2mtc import sen2mtc_metrics
++            return sen2mtc_metrics(pi[:, :3], gi[:, :3])
++        if lin == "tcloud":
++            return LIN.tcloud_metrics(pi[:, :3], gi[:, :3])
++        if lin == "cuhk":
++            return LIN.cuhk_metrics(pi[:, :4], gi[:, :4])
++        if lin == "cuhk_rgb":
++            r = LIN._batched(LIN._cuhk_one, pi[:, :3], gi[:, :3], lpips=False)
++            return {k.replace("cuhk_", "cuhkrgb_"): v for k, v in r.items()}
++        raise SystemExit(f"unknown lineage {lin!r}")
++
++    tot: dict[str, float] = {}
++    for i in range(p.shape[0]):
++        for k, v in one(p[i], g[i]).items():
++            tot[k] = tot.get(k, 0.0) + float(v)
++    return {k: v / p.shape[0] for k, v in tot.items()}
+diff --git a/models/k_diffusion/image_transformer.py b/models/k_diffusion/image_transformer.py
+index e21fbd4..2ced487 100755
+--- a/models/k_diffusion/image_transformer.py
++++ b/models/k_diffusion/image_transformer.py
+@@ -402,7 +402,7 @@ class NeighborhoodSelfAttentionBlock(nn.Module):
+         qkv = self.qkv_proj(x)
+         if natten is None:
+             raise ModuleNotFoundError("natten is required for neighborhood attention")
+-        if natten.has_fused_na():
++        if getattr(natten, "has_fused_na", lambda: hasattr(natten.functional, "na2d"))():
+             q, k, v = rearrange(qkv, "n h w (t nh e) -> t n h w nh e", t=3, e=self.d_head)
+             q, k = scale_for_cosine_sim(q, k, self.scale[:, None], 1e-6)
+             theta = self.pos_emb(pos)
+diff --git a/models/k_diffusion/layers.py b/models/k_diffusion/layers.py
+index f0d7a42..b458f16 100755
+--- a/models/k_diffusion/layers.py
++++ b/models/k_diffusion/layers.py
+@@ -1,7 +1,10 @@
+ from functools import lru_cache, reduce
+ import math
+ 
+-from dctorch import functional as df
++try:
++    from dctorch import functional as df
++except ModuleNotFoundError:
++    df = None
+ import torch
+ from torch import nn
+ from torch.nn import functional as F
+@@ -16,6 +19,9 @@ def append_dims(x, target_dims):
+     return x[(...,) + (None,) * dims_to_append]
+ 
+ def dct(x):
++    if df is None:
++        raise ModuleNotFoundError(
++            "dctorch is required for the DCT loss weighting (pip install dctorch)")
+     if x.ndim == 3:
+         return df.dct(x)
+     if x.ndim == 4:
+diff --git a/models/sgm/evaluator.py b/models/sgm/evaluator.py
+index 19fd2e3..17ba96e 100755
+--- a/models/sgm/evaluator.py
++++ b/models/sgm/evaluator.py
+@@ -6,7 +6,15 @@ import lpips
+ import numpy as np
+ 
+ first_to_cuda = False
+-loss_fn = lpips.LPIPS(net='alex', version=0.1)
++
++_loss_fn = None
++
++
++def _get_loss_fn():
++    global _loss_fn
++    if _loss_fn is None:
++        _loss_fn = lpips.LPIPS(net='alex', version=0.1)
++    return _loss_fn
+ 
+ 
+ def caculate_ssim(imgA, imgB):
+@@ -29,9 +37,10 @@ def caculate_lpips(img0, img1):
+     im2 = img1.float()
+     im1.unsqueeze_(0)
+     im2.unsqueeze_(0)
++    fn = _get_loss_fn()
+     if not first_to_cuda:
+-        loss_fn.to(im1.device)
+-    current_lpips_distance = loss_fn.forward(im1, im2)
++        fn.to(im1.device)
++    current_lpips_distance = fn.forward(im1, im2)
+     return current_lpips_distance.item()
+ 
+ 
+@@ -47,10 +56,8 @@ def img_metrics(target, pred):
+     lpips = 0
+     if (imgA.shape[0] == 4):
+         for i in range(imgA.shape[0]):
+-            imA = imgA[i]
+-            imA = imA.expand(3, 256, 256)
+-            imB = imgB[i]
+-            imB = imB.expand(3, 256, 256)
++            imA = imgA[i].expand(3, *imgA.shape[-2:])
++            imB = imgB[i].expand(3, *imgB.shape[-2:])
+             ssim1 = caculate_ssim(imA, imB)
+             lpips1 = caculate_lpips(imA, imB)
+             ssim += ssim1
+diff --git a/test.py b/test.py
+index b0b54a1..27d32dd 100644
+--- a/test.py
++++ b/test.py
+@@ -13,6 +13,7 @@ from tqdm.auto import tqdm
+ import yaml
+ 
+ from dataset import CRDataset, ISPRSDataset
++from geocr_data import GeoCRSplitDataset, corpus_cfg
+ from engine import OARFlowEngine
+ from models.k_diffusion import image_transformer
+ 
+@@ -40,6 +41,26 @@ def load_config(config_path):
+         return dict_to_namespace(yaml.safe_load(f))
+ 
+ 
++def apply_overrides_ns(config, assignments):
++    """Apply dotted `--set a.b=c` overrides, as in train.py."""
++    for a in assignments or []:
++        if "=" not in a:
++            raise SystemExit(f"--set expects key.path=value, got {a!r}")
++        key, val = a.split("=", 1)
++        node, parts = config, key.split(".")
++        for k in parts[:-1]:
++            if not hasattr(node, k):
++                raise SystemExit(f"--set {key}: no section {k!r} in the config")
++            node = getattr(node, k)
++        if not hasattr(node, parts[-1]):
++            raise SystemExit(f"--set {key}: unknown key")
++        parsed = yaml.safe_load(val)
++        if isinstance(getattr(node, parts[-1]), str) and isinstance(parsed, bool):
++            parsed = val
++        setattr(node, parts[-1], dict_to_namespace(parsed))
++    return config
++
++
+ def prepare_batch(batch, device):
+     if isinstance(batch, dict):
+         return {k: prepare_batch(v, device) for k, v in batch.items()}
+@@ -80,12 +101,22 @@ def find_checkpoint(config, args):
+     return ckpts[-1]
+ 
+ 
+-def build_test_dataset(config):
++def build_test_dataset(config, split="test"):
++    """Test dataset; with `dataset.kind: geocr` it is the whole split list (`val_size` is not applied)."""
++    kind = getattr(config.dataset, "kind", None)
++    if kind == "geocr":
++        return GeoCRSplitDataset(
++            corpus=config.dataset.corpus, split=split,
++            splits_dir=getattr(config.dataset, "splits_dir", "splits"),
++            root=getattr(config.dataset, "root", None) or None,
++            cond_frames=getattr(config.dataset, "cond_frames", None),
++            anchor_frame=getattr(config.dataset, "anchor_frame", 0),
++            rgb_view=getattr(config.gcpa, "rgb_view", "model_norm"))
+     data_dir = config.dataset.data_dir
+     val_size = getattr(config.dataset, "val_size", None)
+-    if "changsha" in data_dir or "guangzhou" in data_dir:
++    if kind == "cr" or "changsha" in data_dir or "guangzhou" in data_dir:
+         return CRDataset(data_dir, mode="test", val_size=val_size)
+-    if "Potsdam" in data_dir or "Vaihingen" in data_dir:
++    if kind == "isprs" or "Potsdam" in data_dir or "Vaihingen" in data_dir:
+         return ISPRSDataset(config.dataset, mode="test", val_size=val_size)
+     raise ValueError(f"Unknown dataset path: {data_dir}")
+ 
+@@ -120,6 +151,7 @@ def main(args):
+     torch.set_grad_enabled(False)
+     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
+     config = load_config(args.config)
++    apply_overrides_ns(config, args.set)
+ 
+     if getattr(config.misc, "seed", None) is not None:
+         torch.manual_seed(config.misc.seed)
+@@ -191,6 +223,8 @@ def main(args):
+ def parse_args():
+     parser = argparse.ArgumentParser(description="Test GACR hourglass Transformer cloud removal model.")
+     parser.add_argument("--config", type=str, required=True)
++    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
++                        help="dotted config override, repeatable")
+     parser.add_argument("--ckpt", type=str, default=None, help="Explicit checkpoint path.")
+     parser.add_argument("--ckpt-step", type=int, default=None, help="Checkpoint step under exps/<exp_name>/checkpoints.")
+     parser.add_argument("--state-key", type=str, default="ema", choices=["ema", "model"])
+diff --git a/train.py b/train.py
+index 571e766..c4d8ec6 100755
+--- a/train.py
++++ b/train.py
+@@ -20,13 +20,17 @@ from tqdm.auto import tqdm
+ 
+ from accelerate import Accelerator
+ from accelerate.logging import get_logger
+-from accelerate.utils import ProjectConfiguration, set_seed
++from accelerate.utils import ProjectConfiguration, broadcast, set_seed
++import time
+ 
+ from models.k_diffusion import image_transformer
+ from engine import OARFlowEngine
+ from utils import load_encoders
+ 
+ from dataset import CRDataset, ISPRSDataset
++from geocr_data import (
++    GeoCRSplitDataset, corpus_cfg, dev_metrics, sample_noise, split_sha256,
++)
+ from diffusers.models import AutoencoderKL
+ import wandb
+ import math
+@@ -78,6 +82,7 @@ class GCPAFeatureExtractor(torch.nn.Module):
+             getattr(gcpa_config, "hf_model_name", DEFAULT_GCPA_MODELS[self.vfm]),
+         )
+ 
++        self.native = bool(getattr(gcpa_config, "native_resolution", False))
+         if self.vfm == "dinov3":
+             repo_path = getattr(gcpa_config, "repo_path", "facebookresearch/dinov3")
+             source = getattr(gcpa_config, "source", "github")
+@@ -112,10 +117,21 @@ class GCPAFeatureExtractor(torch.nn.Module):
+ 
+         self.model.eval()
+         requires_grad(self.model, False)
++        self.patch = 16
++        if self.native and self.vfm not in ("dinov3", "mae"):
++            raise ValueError(
++                f"gcpa.native_resolution is only valid for a patch-16 backbone; "
++                f"{self.vfm} is not one.")
+ 
+     def preprocess(self, clear):
+         x = (clear.float() + 1.0) * 0.5
+         x = x.clamp(0.0, 1.0)
++        if self.native:
++            if x.shape[-1] % self.patch or x.shape[-2] % self.patch:
++                raise ValueError(
++                    f"gcpa.native_resolution needs H,W divisible by "
++                    f"{self.patch}; got {tuple(x.shape[-2:])}.")
++            return self.normalize(x)
+         if x.shape[-2:] != (self.image_size, self.image_size):
+             x = F.interpolate(x, size=(self.image_size, self.image_size), mode="bicubic", align_corners=False)
+         return self.normalize(x)
+@@ -130,8 +146,10 @@ class GCPAFeatureExtractor(torch.nn.Module):
+         else:
+             tokens = self.model(pixel_values=x, interpolate_pos_encoding=True).last_hidden_state[:, 1:, :]
+ 
+-        if tokens.shape[1] != 256:
+-            raise ValueError(f"{self.vfm} produced {tokens.shape[1]} tokens; GCPA expects 256.")
++        expect = ((x.shape[-2] // self.patch) * (x.shape[-1] // self.patch)
++                  if self.native else 256)
++        if tokens.shape[1] != expect:
++            raise ValueError(f"{self.vfm} produced {tokens.shape[1]} tokens; GCPA expects {expect}.")
+         if tokens.shape[2] != 1024:
+             raise ValueError(f"{self.vfm} produced dim {tokens.shape[2]}; GCPA projector expects 1024.")
+         return [z.detach() for z in tokens]
+@@ -181,6 +199,49 @@ def write_validation_metrics_csv(save_dir, step, metrics):
+         writer.writerow(row)
+ 
+ 
++@torch.no_grad()
++def run_dev(engine, module, loader, ccfg, num_steps, seed, device, accelerator):
++    """Dev-split metrics of one weight set (raw or EMA), with per-sample keyed noise."""
++    prev, was_training = engine.model, module.training
++    engine.model = module
++    module.eval()
++    tot, n = {}, 0
++    for b in loader:
++        clear = b["clear"].to(device)
++        mu = b["cloudy"].to(device)
++        cond = b["cond"].to(device)
++        noise = torch.stack([sample_noise(sid, tuple(mu.shape[1:]), seed)
++                             for sid in b["sid"]]).to(device)
++        with accelerator.autocast():
++            samples, _ = engine.sample(cond, mu, uc=cond, batch_size=mu.shape[0],
++                                       shape=mu.shape[1:], num_steps=num_steps,
++                                       noise=noise)
++        m = dev_metrics(samples.float(), clear.float(), ccfg)
++        for k, v in m.items():
++            tot[k] = tot.get(k, 0.0) + float(v) * mu.shape[0]
++        n += mu.shape[0]
++    engine.model = prev
++    if was_training:
++        module.train()
++    return {k: v / max(n, 1) for k, v in tot.items()}
++
++
++def dev_slope_last10(history, key, steps_used, tag="raw"):
++    """Change of the dev metric over the last 10% of training."""
++    if len(history) < 2:
++        return None
++    lo = 0.9 * steps_used
++    win = [r for st, r in history if st >= lo]
++    if len(win) < 2:
++        win = [r for _, r in history[-2:]]
++    if f"{tag}_{key}" not in win[0]:
++        tag = "ema" if f"ema_{key}" in win[0] else "raw"
++    try:
++        return round(float(win[-1][f"{tag}_{key}"] - win[0][f"{tag}_{key}"]), 6)
++    except KeyError:
++        return None
++
++
+ def create_logger(logging_dir):
+     """
+     Create a logger that writes to a log file and stdout.
+@@ -203,9 +264,31 @@ def requires_grad(model, flag=True):
+         p.requires_grad = flag
+ 
+ 
++def apply_overrides(cfg_dict, assignments):
++    """Apply dotted `--set a.b=c` overrides (values parsed as YAML); an unknown key is an error."""
++    for a in assignments or []:
++        if "=" not in a:
++            raise SystemExit(f"--set expects key.path=value, got {a!r}")
++        key, val = a.split("=", 1)
++        node, parts = cfg_dict, key.split(".")
++        for k in parts[:-1]:
++            if not isinstance(node, dict) or k not in node:
++                raise SystemExit(f"--set {key}: no section {k!r} in the config")
++            node = node[k]
++        if not isinstance(node, dict) or parts[-1] not in node:
++            raise SystemExit(
++                f"--set {key}: unknown key; add it to the config first")
++        parsed = yaml.safe_load(val)
++        if isinstance(node[parts[-1]], str) and isinstance(parsed, bool):
++            parsed = val
++        node[parts[-1]] = parsed
++    return cfg_dict
++
++
+ def load_config(args=None):
+     with open(args.config, "r") as f:
+         cfg_dict = yaml.safe_load(f)
++    cfg_dict = apply_overrides(cfg_dict, getattr(args, "set", None))
+ 
+     def dict_to_namespace(d):
+         if isinstance(d, dict):
+@@ -294,21 +377,61 @@ def main(args):
+     )
+ 
+     # Setup data:
+-    if 'changsha' in config.dataset.data_dir or 'guangzhou' in config.dataset.data_dir:
++    kind = getattr(config.dataset, 'kind', None)
++    if kind is None:
++        d = config.dataset.data_dir
++        kind = ('cr' if ('changsha' in d or 'guangzhou' in d) else
++                'isprs' if ('Potsdam' in d or 'Vaihingen' in d) else None)
++        if kind is None:
++            raise ValueError(
++                "Unknown dataset path and no dataset.kind given. "
++                f"Got: {d}. Set dataset.kind to one of geocr|cr|isprs.")
++    ccfg = None
++    train_split_name = str(getattr(config.dataset, 'train_split', 'train'))
++    if kind == 'geocr':
++        ccfg = corpus_cfg(config.dataset.corpus)
++        common = dict(
++            corpus=config.dataset.corpus,
++            splits_dir=getattr(config.dataset, 'splits_dir', 'splits'),
++            root=getattr(config.dataset, 'root', None) or None,
++            cond_frames=getattr(config.dataset, 'cond_frames', None),
++            anchor_frame=getattr(config.dataset, 'anchor_frame', 0),
++            rgb_view=getattr(config.gcpa, 'rgb_view', 'model_norm'),
++        )
++        train_dataset = GeoCRSplitDataset(split=train_split_name, **common)
++        val_dataset = GeoCRSplitDataset(
++            split=getattr(config.dataset, 'val_split', 'val'),
++            max_items=getattr(config.dataset, 'val_max_items', None), **common)
++        want_in = ccfg['c_target'] * (1 + train_dataset.k)
++        if (config.model.in_channels != want_in
++                or config.model.out_channels != ccfg['c_target']):
++            raise ValueError(
++                f"{config.dataset.corpus}: model.in_channels/out_channels are "
++                f"{config.model.in_channels}/{config.model.out_channels} but the "
++                f"data needs {want_in}/{ccfg['c_target']} "
++                f"(target {ccfg['c_target']} ch + {train_dataset.k} cond frames). "
++                f"The denoiser concatenates x and cond at "
++                f"image_transformer.py:1177-1180, so a mismatch is a shape error "
++                f"at step 1 at best and a wrong-band model at worst.")
++    elif kind == 'cr':
+         train_dataset = CRDataset(config.dataset.data_dir, mode='train')
+         val_dataset = CRDataset(config.dataset.data_dir, mode='test', val_size=config.dataset.val_size)
+-
+-    # ISPRS data
+-    elif 'Potsdam' in config.dataset.data_dir or 'Vaihingen' in config.dataset.data_dir:
++    elif kind == 'isprs':
+         train_dataset = ISPRSDataset(config.dataset, mode='train')
+         val_dataset = ISPRSDataset(config.dataset, mode='test', val_size=config.dataset.val_size)
+     else:
+-        raise ValueError(
+-            "Unknown dataset path."
+-            f"Got: {config.dataset.data_dir}"
+-        )
++        raise ValueError(f"unknown dataset.kind {kind!r}")
+ 
+-    local_batch_size = int(config.dataset.batch_size // accelerator.num_processes)
++    _accum = int(config.optimization.gradient_accumulation_steps)
++    _div = accelerator.num_processes * _accum
++    if config.dataset.batch_size % _div:
++        raise ValueError(
++            f"dataset.batch_size={config.dataset.batch_size} is not divisible by "
++            f"num_processes({accelerator.num_processes}) x "
++            f"gradient_accumulation_steps({_accum})")
++    local_batch_size = config.dataset.batch_size // _div
++    if local_batch_size < 1:
++        raise ValueError("local batch size resolved to 0")
+     train_dataloader = DataLoader(
+         train_dataset,
+         batch_size=local_batch_size,
+@@ -319,15 +442,18 @@ def main(args):
+     )
+     val_dataloader = DataLoader(
+         val_dataset,
+-        batch_size=1,
++        batch_size=int(getattr(config.dataset, 'val_batch_size', 1)),
+         shuffle=False,
+         num_workers=config.misc.num_workers,
+         pin_memory=True,
+-        drop_last=True
++        drop_last=False
+     )
+ 
+     if accelerator.is_main_process:
+-        logger.info(f"Dataset contains {len(train_dataset):,} images ({config.dataset.data_dir})")
++        _src = (getattr(config.dataset, 'corpus', None)
++                or getattr(config.dataset, 'data_dir', '?'))
++        logger.info(f"Dataset contains {len(train_dataset):,} images ({_src}); "
++                    f"dev split: {len(val_dataset):,}")
+ 
+     # Prepare models for training:
+     update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
+@@ -347,8 +473,8 @@ def main(args):
+         optimizer.load_state_dict(ckpt['opt'])
+         global_step = ckpt['steps']
+ 
+-    model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
+-        model, optimizer, train_dataloader, val_dataloader
++    model, optimizer, train_dataloader = accelerator.prepare(
++        model, optimizer, train_dataloader
+     )
+ 
+     if accelerator.is_main_process and config.logging.report_to:
+@@ -375,7 +501,8 @@ def main(args):
+         path_type=config.loss.path_type,
+         accelerator=accelerator,
+         weighting=config.loss.weighting,
+-        p=getattr(config.loss, "p", 3.0)
++        p=getattr(config.loss, "p", 3.0),
++        proj_loss_impl=getattr(config.loss, "proj_loss_impl", "loop")
+     )
+ 
+     if not hasattr(config, "gcpa"):
+@@ -397,6 +524,15 @@ def main(args):
+             logger.info(f"Using online GCPA VFM: {vfm.vfm} ({vfm.model_path})")
+             logger.info(f"VFM Parameters: {sum(p.numel() for p in vfm.parameters()):,}")
+ 
++    dev_key = getattr(config.dataset, 'dev_key', None) or (
++        ccfg['dev_key'] if ccfg else 'PSNR')
++    patience = int(getattr(config.logging, 'early_stop_patience_evals', 5))
++    dev_select = bool(getattr(config.logging, 'dev_select', True))
++    eval_nfe = int(getattr(config.misc, 'eval_num_steps', 4))
++    best = {'ema': (-float('inf'), 0), 'raw': (-float('inf'), 0)}
++    dev_history, dev_evals, stop_early = [], 0, False
++    t_start = time.time()
++
+     for epoch in range(config.optimization.epochs):
+         engine.model.train()
+         for batch in train_dataloader:
+@@ -404,7 +540,7 @@ def main(args):
+                 zs = get_cached_features(batch, feats_db, device=device)
+             else:
+                 with torch.no_grad():
+-                    zs = vfm(batch["clear"])
++                    zs = vfm(batch.get("rgb", batch["clear"]))
+             with accelerator.accumulate(engine.model):
+                 loss, proj_loss = engine(batch, zs=zs)
+                 loss_mean = loss.mean()
+@@ -427,7 +563,8 @@ def main(args):
+             if accelerator.sync_gradients:
+                 progress_bar.update(1)
+                 global_step += 1
+-            if global_step % config.optimization.checkpointing_steps == 0 or global_step == 1:
++            _cs = int(config.optimization.checkpointing_steps)
++            if _cs > 0 and global_step > 0 and global_step % _cs == 0:
+                 if accelerator.is_main_process:
+                     checkpoint = {
+                         "model": accelerator.unwrap_model(engine.model).state_dict(),
+@@ -440,25 +577,63 @@ def main(args):
+                     torch.save(checkpoint, checkpoint_path)
+                     logger.info(f"Saved checkpoint to {checkpoint_path}")
+ 
+-            # val step
+-            if (global_step == 1 or (global_step % config.logging.sampling_steps == 0 and global_step > 0)):
+-                engine.model.eval()
+-                engine.avg_metrics.reset()
+-                for j, batch_val in enumerate(tqdm(val_dataloader, desc='Val')):
+-                    engine.test_step(batch_val)
+-                metrics = engine.avg_metrics.value()
+-                accelerator.log(metrics, step=global_step)
+-                if accelerator.is_main_process:
+-                    write_validation_metrics_csv(save_dir, global_step, metrics)
+-                batch_log = {k: batch[k][:1] for k in batch}
+-                image_results = engine.log_images(batch_log, N=1, sample=True)
+-                if config.logging.report_to:
+-                    accelerator.log({"input": wandb.Image(array2grid(image_results['input'])),
+-                                     "mean": wandb.Image(array2grid(image_results['mean'])),
+-                                     "samples": wandb.Image(array2grid(image_results['samples'])),
+-                                     },
+-                                    step=global_step)
+-                engine.model.train()
++            if (dev_select and global_step > 0
++                    and global_step % config.logging.sampling_steps == 0):
++                if ccfg is None:
++                    engine.model.eval()
++                    engine.avg_metrics.reset()
++                    for j, batch_val in enumerate(tqdm(val_dataloader, desc='Val')):
++                        engine.test_step(batch_val)
++                    metrics = engine.avg_metrics.value()
++                    accelerator.log(metrics, step=global_step)
++                    if accelerator.is_main_process:
++                        write_validation_metrics_csv(save_dir, global_step, metrics)
++                    engine.model.train()
++                else:
++                    dev_evals += 1
++                    improved = torch.zeros(1, device=device)
++                    if accelerator.is_main_process:
++                        raw_mod = accelerator.unwrap_model(engine.model)
++                        row = {}
++                        for tag, mod in (('raw', raw_mod), ('ema', ema)):
++                            m = run_dev(engine, mod, val_dataloader, ccfg,
++                                        eval_nfe, config.misc.seed, device,
++                                        accelerator)
++                            row.update({f'{tag}_{k}': v for k, v in m.items()})
++                            v = m[dev_key]
++                            if v > best[tag][0]:
++                                best[tag] = (v, global_step)
++                                torch.save({tag: mod.state_dict(),
++                                            'steps': global_step,
++                                            'dev_key': dev_key, 'dev_value': v,
++                                            'config': config},
++                                           f"{checkpoint_dir}/best_{tag}.pt")
++                                improved[0] = 1.0
++                        row['_best_step'] = max(best['raw'][1], best['ema'][1])
++                        dev_history.append((global_step, row))
++                        write_validation_metrics_csv(save_dir, global_step, row)
++                        accelerator.log({k: v for k, v in row.items()
++                                         if not k.startswith('_')},
++                                        step=global_step)
++                        logger.info(
++                            f"dev@{global_step}: raw {dev_key}="
++                            f"{row.get('raw_' + dev_key):.4f}  ema {dev_key}="
++                            f"{row.get('ema_' + dev_key):.4f}  "
++                            f"best raw={best['raw'][0]:.4f}@{best['raw'][1]} "
++                            f"ema={best['ema'][0]:.4f}@{best['ema'][1]}")
++                        newest = max(best['raw'][1], best['ema'][1])
++                        if (patience > 0 and (global_step - newest)
++                                >= patience * config.logging.sampling_steps):
++                            improved[0] = -1.0
++                    improved = broadcast(improved)
++                    stop_early = bool(improved[0].item() == -1.0)
++                    engine.model.train()
++                    if stop_early:
++                        if accelerator.is_main_process:
++                            logger.info(
++                                f"EARLY STOP at {global_step}: no dev "
++                                f"improvement for {patience} evaluations")
++                        break
+ 
+             logs = {
+                 "loss": accelerator.gather(loss_mean).mean().detach().item(),
+@@ -470,13 +645,71 @@ def main(args):
+ 
+             if global_step >= config.optimization.max_train_steps:
+                 break
+-        if global_step >= config.optimization.max_train_steps:
++        if stop_early or global_step >= config.optimization.max_train_steps:
+             break
+ 
++    epoch_cap_bound = bool(not stop_early
++                           and global_step < config.optimization.max_train_steps)
++    if epoch_cap_bound and accelerator.is_main_process:
++        logger.info(
++            f"!! EPOCH CAP BOUND: stopped at {global_step} of "
++            f"{config.optimization.max_train_steps} steps because "
++            f"optimization.epochs={config.optimization.epochs} ran out. "
++            f"Raise it and re-run.")
++
+     model.eval()  # important! This disables randomized embedding dropout
+ 
+     accelerator.wait_for_everyone()
+     if accelerator.is_main_process:
++        report = {
++            "steps_used": global_step,
++            "max_train_steps": config.optimization.max_train_steps,
++            "ceiling_hit": bool(global_step >= config.optimization.max_train_steps),
++            "early_stopped": bool(stop_early),
++            "epoch_cap_bound": epoch_cap_bound,
++            "dev_evaluations_consumed": dev_evals,
++            "dev_key": dev_key,
++            "dev_slope_last10": dev_slope_last10(
++                dev_history, dev_key, global_step,
++                max(best, key=lambda k: best[k][0])),
++            "batch_global": config.dataset.batch_size,
++            "microbatch": local_batch_size,
++            "grad_accum": config.optimization.gradient_accumulation_steps,
++            "world_size": accelerator.num_processes,
++            "lr": float(config.optimization.learning_rate),
++            "seed": config.misc.seed,
++            "wall_clock_h": round((time.time() - t_start) / 3600.0, 4),
++            "params_trainable": sum(p.numel() for p in model.parameters()
++                                    if p.requires_grad),
++            "params_total": sum(p.numel() for p in model.parameters()),
++            "epochs_used": round(global_step * config.dataset.batch_size
++                                 / max(len(train_dataset), 1), 3),
++            "n_train": len(train_dataset),
++            "n_dev": len(val_dataset),
++            "best_dev": {k: {"value": v[0], "step": v[1]} for k, v in best.items()},
++            "dev_select": dev_select,
++            "ckpt_selection": ("last(upstream)" if ccfg is None else
++                               ("best_on_dev(ema|raw)" if dev_select else "final")),
++            "ckpt_selected": ("last" if ccfg is None else
++                              (max(best, key=lambda k: best[k][0]) if dev_select
++                               else "ema")),
++            "proj_loss_impl": getattr(config.loss, "proj_loss_impl", "loop"),
++            "gcpa": {"vfm": config.gcpa.vfm,
++                     "offline": bool(getattr(config.gcpa, "offline", True)),
++                     "native_resolution": bool(getattr(config.gcpa,
++                                                       "native_resolution", False)),
++                     "rgb_view": getattr(config.gcpa, "rgb_view", "model_norm"),
++                     "model_path": str(getattr(config.gcpa, "model_path", ""))},
++        }
++        if ccfg is not None:
++            report["corpus"] = ccfg["name"]
++            report["splits_dir"] = getattr(config.dataset, "splits_dir", "splits")
++            report["train_split"] = train_split_name
++            report["train_split_sha256"] = split_sha256(
++                train_dataset.root, train_split_name, train_dataset.splits_dir)
++        with open(os.path.join(save_dir, "train_report.json"), "w") as f:
++            json.dump(report, f, indent=2)
++        logger.info(f"Wrote {save_dir}/train_report.json")
+         logger.info("Done!")
+     accelerator.end_training()
+ 
+@@ -485,6 +718,8 @@ def parse_args():
+     parser = argparse.ArgumentParser(description="Training")
+     parser.add_argument("--exp-name", type=str, default=None)
+     parser.add_argument("--config", type=str, required=True)
++    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
++                        help="dotted config override, repeatable")
+     args = parser.parse_args()
+     return args
+ 
+diff --git a/vfm_hub/hubconf.py b/vfm_hub/hubconf.py
+new file mode 100644
+index 0000000..aac5169
+--- /dev/null
++++ b/vfm_hub/hubconf.py
+@@ -0,0 +1,14 @@
++"""torch.hub entry points for the DINOv3 backbones only (set gcpa.repo_path to this directory)."""
++import os
++import sys
++
++dependencies = ["torch"]
++
++DINOV3_ROOT = os.environ.get("DINOV3_ROOT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "dinov3"))
++if DINOV3_ROOT not in sys.path:
++    sys.path.insert(0, DINOV3_ROOT)
++
++from dinov3.hub.backbones import (
++    dinov3_vit7b16, dinov3_vitb16, dinov3_vitl16, dinov3_vitl16plus,
++    dinov3_vits16, dinov3_vits16plus,
++)

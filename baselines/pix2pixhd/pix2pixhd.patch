@@ -1,0 +1,273 @@
+diff --git a/data/custom_dataset_data_loader.py b/data/custom_dataset_data_loader.py
+index 0b98254..ff1d71d 100755
+--- a/data/custom_dataset_data_loader.py
++++ b/data/custom_dataset_data_loader.py
+@@ -4,8 +4,12 @@ from data.base_data_loader import BaseDataLoader
+ 
+ def CreateDataset(opt):
+     dataset = None
+-    from data.aligned_dataset import AlignedDataset
+-    dataset = AlignedDataset()
++    if str(opt.dataroot).startswith('geocr:'):
++        from data.geocr_dataset import GeoCRAlignedDataset
++        dataset = GeoCRAlignedDataset()
++    else:
++        from data.aligned_dataset import AlignedDataset
++        dataset = AlignedDataset()
+ 
+     print("dataset [%s] was created" % (dataset.name()))
+     dataset.initialize(opt)
+diff --git a/data/geocr_dataset.py b/data/geocr_dataset.py
+new file mode 100644
+index 0000000..445f499
+--- /dev/null
++++ b/data/geocr_dataset.py
+@@ -0,0 +1,24 @@
++"""Selected by --dataroot geocr:<corpus>; the split is --phase. Returns the dict AlignedDataset returns
++under --label_nc 0 --no_instance, with label = cloudy, image = clear and one shared transform draw."""
++from PIL import Image
++
++from data.base_dataset import BaseDataset, get_params, get_transform
++
++
++class GeoCRAlignedDataset(BaseDataset):
++    def name(self):
++        return 'GeoCRAlignedDataset'
++
++    def initialize(self, opt):
++        from geocr_data import GeoCRPairDataset
++        self.opt = opt
++        self.pairs = GeoCRPairDataset(str(opt.dataroot).split(':')[1], opt.phase)
++
++    def __getitem__(self, index):
++        cloudy_u8, clear_u8, sid = self.pairs.pair_u8(index)
++        A, B = Image.fromarray(cloudy_u8), Image.fromarray(clear_u8)
++        transform = get_transform(self.opt, get_params(self.opt, A.size))
++        return {'label': transform(A), 'inst': 0, 'image': transform(B), 'feat': 0, 'path': sid}
++
++    def __len__(self):
++        return len(self.pairs)
+diff --git a/dump.py b/dump.py
+new file mode 100644
+index 0000000..776e304
+--- /dev/null
++++ b/dump.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python
++"""Write test-set predictions for geocr.eval: <out>/preds/<id>.npy (float32 CHW in [0, 1],
++unclipped) and <out>/manifest.json.
++
++    python dump.py --corpus <corpus> --ckpt <dir with final_net_G.pth> --out <dir>
++"""
++import argparse
++import json
++from pathlib import Path
++
++import numpy as np
++import torch
++
++import geocr_data as G
++import rescore as RS
++from models import networks
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--corpus", required=True)
++    ap.add_argument("--ckpt", required=True, help="directory holding final_net_G.pth")
++    ap.add_argument("--out", required=True)
++    ap.add_argument("--batch_size", type=int, default=16)
++    a = ap.parse_args()
++
++    ds = G.GeoCRPairDataset(a.corpus, "test")
++    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    ckpt = Path(a.ckpt) / "final_net_G.pth"
++    netG = networks.define_G(3, 3, 64, "global", 4, 9, norm="instance", gpu_ids=[]).to(device)
++    netG.load_state_dict(torch.load(ckpt, map_location="cpu", weights_only=True), strict=True)
++    netG.eval()
++
++    preds = Path(a.out) / "preds"
++    preds.mkdir(parents=True, exist_ok=True)
++    torch.set_grad_enabled(False)
++    for lo in range(0, len(ds), a.batch_size):
++        items = [ds[i] for i in range(lo, min(lo + a.batch_size, len(ds)))]
++        x01 = torch.from_numpy(np.stack([it[0] for it in items])).to(device)
++        pred01 = ((netG(x01 * 2.0 - 1.0).float().cpu() + 1.0) / 2.0).numpy()
++        for p, (_, _, sid) in zip(pred01, items):
++            np.save(preds / f"{Path(G.sid_flat(sid)).stem}.npy",
++                    np.ascontiguousarray(p, dtype=np.float32))
++
++    cfg = ds.cfg
++    man = {"corpus": cfg["corpus"], "split": "test",
++           "split_list_sha256": G.split_sha256(cfg, "test"), "n_items": len(ds),
++           "resolution": list(cfg["resolution"]), "crop": "none", "bands": list(cfg["bands"]),
++           "domain": cfg["domain"], "processing_level": cfg["level"],
++           "ckpt_selection": "final", "train_split_sha256": G.split_sha256(cfg, "trainval"),
++           "method": "pix2pixhd", "ckpt_sha256": RS.sha256_file(ckpt)}
++    missing = [k for k in RS.IDENTITY_KEYS if k not in man]
++    if missing:
++        raise SystemExit(f"manifest lacks {missing}")
++    (Path(a.out) / "manifest.json").write_text(json.dumps(man, indent=2) + "\n")
++    print(f"{len(ds)} predictions -> {a.out}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/geocr_data.py b/geocr_data.py
+new file mode 100644
+index 0000000..1333057
+--- /dev/null
++++ b/geocr_data.py
+@@ -0,0 +1,57 @@
++"""GeoCR data adapter: ids from <dataset root>/splits/<split>.txt, pixels from the 8-bit RGB
++export <CR_EXPORTS>/<corpus>/<split>/{cloudy,clear}/<id>.png, paired by id."""
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++import numpy as np
++from PIL import Image
++
++import rescore as RS
++
++CR_EXPORTS = Path(os.environ.get("CR_EXPORTS", "CR_exports"))
++CORPORA = ("tcloud", "cuhk_cr2", "sen2mtc_new_rgb", "sen12mscr_rgb", "whus2crv_rgb")
++SPLITS_DIR = "splits"
++
++
++def corpus_cfg(name: str) -> dict:
++    if name not in CORPORA:
++        raise SystemExit(f"no pix2pixHD config for {name!r}; choose from {CORPORA}")
++    return dict(RS.CORPORA[name], corpus=name)
++
++
++def sid_flat(sid: str) -> str:
++    return sid.replace("/", "__")
++
++
++def split_sha256(cfg: dict, split: str) -> str:
++    return RS.sha256_file(Path(cfg["root"]) / SPLITS_DIR / f"{split}.txt")
++
++
++def _read_u8(p: Path) -> np.ndarray:
++    with Image.open(p) as im:
++        return np.asarray(im.convert("RGB"), dtype=np.uint8)
++
++
++class GeoCRPairDataset:
++    """Items are (cloudy, clear, id) as float32 CHW in [0, 1]; pair_u8 returns the stored HWC uint8."""
++
++    def __init__(self, corpus: str, split: str):
++        self.cfg = corpus_cfg(corpus)
++        self.split = split
++        self.ids = RS.read_split(Path(self.cfg["root"]), split, SPLITS_DIR)
++
++    def __len__(self) -> int:
++        return len(self.ids)
++
++    def pair_u8(self, idx: int):
++        sid = self.ids[idx]
++        d = CR_EXPORTS / self.cfg["corpus"] / self.split
++        name = Path(sid_flat(sid)).with_suffix(".png").name
++        return _read_u8(d / "cloudy" / name), _read_u8(d / "clear" / name), sid
++
++    def __getitem__(self, idx: int):
++        cy, cl, sid = self.pair_u8(idx)
++        f = lambda a: np.ascontiguousarray(a.transpose(2, 0, 1), dtype=np.float32) / 255.0  # noqa: E731
++        return f(cy), f(cl), sid
+diff --git a/train_geocr.py b/train_geocr.py
+new file mode 100644
+index 0000000..bbe8dc0
+--- /dev/null
++++ b/train_geocr.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python
++"""Train pix2pixHD for exactly --max_steps updates (one G and one D step per batch).
++
++    python train_geocr.py --name <run> --checkpoints_dir runs $TRAIN_ARGS --seed 0
++
++TRAIN_ARGS come from configs/<corpus>.sh. The model, losses, optimizers and per-epoch LR decay are
++the repository's own; the epoch horizon is derived from --max_steps (constant LR for the first
++half of the epochs, linear decay over the second half). Writes final_net_{G,D}.pth.
++"""
++import math
++import random
++import time
++
++import numpy as np
++import torch
++from torch.autograd import Variable
++
++from data.custom_dataset_data_loader import CreateDataset
++from models.models import create_model
++from options.train_options import TrainOptions
++
++
++class GeoCRTrainOptions(TrainOptions):
++    def initialize(self):
++        TrainOptions.initialize(self)
++        self.parser.add_argument('--max_steps', type=int, required=True)
++        self.parser.add_argument('--seed', type=int, default=0)
++
++
++def seed_all(seed: int) -> None:
++    random.seed(seed)
++    np.random.seed(seed)
++    torch.manual_seed(seed)
++    torch.cuda.manual_seed_all(seed)
++
++
++def main() -> int:
++    opt = GeoCRTrainOptions().parse()
++    seed_all(opt.seed)
++    dataset = CreateDataset(opt)
++    loader = torch.utils.data.DataLoader(
++        dataset, batch_size=opt.batchSize, shuffle=True, num_workers=int(opt.nThreads),
++        drop_last=True, generator=torch.Generator().manual_seed(opt.seed))
++    e_total = math.ceil(opt.max_steps / len(loader))
++    opt.niter = math.ceil(e_total / 2)
++    opt.niter_decay = e_total - opt.niter
++    print(f"n_train={len(dataset)} steps/epoch={len(loader)} "
++          f"epochs={opt.niter}+{opt.niter_decay} lr={opt.lr}")
++
++    model = create_model(opt)
++    optimizer_G, optimizer_D = model.module.optimizer_G, model.module.optimizer_D
++    t0, step, epoch = time.time(), 0, 1
++    model.train()
++    while step < opt.max_steps:
++        for data in loader:
++            losses, _ = model(Variable(data['label']), Variable(data['inst']),
++                              Variable(data['image']), Variable(data['feat']), infer=False)
++            losses = [torch.mean(x) if not isinstance(x, int) else x for x in losses]
++            loss_dict = dict(zip(model.module.loss_names, losses))
++            loss_D = (loss_dict['D_fake'] + loss_dict['D_real']) * 0.5
++            loss_G = loss_dict['G_GAN'] + loss_dict.get('G_GAN_Feat', 0) + loss_dict.get('G_VGG', 0)
++
++            optimizer_G.zero_grad()
++            loss_G.backward()
++            optimizer_G.step()
++
++            optimizer_D.zero_grad()
++            loss_D.backward()
++            optimizer_D.step()
++
++            step += 1
++            if step % 100 == 0 or step == opt.max_steps:
++                errs = " ".join(f"{k}={float(v):.4f}" for k, v in loss_dict.items())
++                print(f"[{step}/{opt.max_steps}] ep{epoch} {errs} ({time.time() - t0:.0f}s)",
++                      flush=True)
++            if step >= opt.max_steps:
++                break
++        if step < opt.max_steps:
++            if epoch > opt.niter:
++                model.module.update_learning_rate()
++            epoch += 1
++
++    model.module.save('final')
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
